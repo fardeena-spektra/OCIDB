@@ -1,0 +1,161 @@
+{
+  "packageId": "d23126c7-4613-4ab6-97ac-0c0678b072e2",
+  "slug": "oracle-backup-recovery-and-diagnostics-jUQnc",
+  "title": "Oracle Backup, Recovery & Diagnostics",
+  "version": 1,
+  "exportedAt": "2026-10-01T13:35:52.468Z",
+  "force": false,
+  "deliverableConfig": {
+    "arm": {
+      "stages": 1,
+      "enabled": true
+    },
+    "cse": {
+      "enabled": true
+    },
+    "rbac": {
+      "enabled": true
+    },
+    "policy": {
+      "enabled": true
+    },
+    "readme": {
+      "enabled": true
+    },
+    "labGuide": {
+      "enabled": true,
+      "exercises": 3
+    },
+    "solution": {
+      "enabled": true
+    },
+    "questions": {
+      "count": 5,
+      "enabled": true
+    },
+    "specSheet": {
+      "enabled": true
+    },
+    "validations": {
+      "count": 3,
+      "enabled": true
+    }
+  },
+  "artifacts": [
+    {
+      "path": "DeploymentPackage/deploy-01.json",
+      "kind": "cft",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "DeploymentPackage/deploy-01.parameters.json",
+      "kind": "cft_params",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "DeploymentPackage/Scripts/userdata-01.sh",
+      "kind": "bash_script",
+      "lintStatus": "warn"
+    },
+    {
+      "path": "Inline-Questions/question-01.md",
+      "kind": "question_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "Inline-Questions/question-02.md",
+      "kind": "question_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "Inline-Questions/question-03.md",
+      "kind": "question_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "Inline-Questions/question-04.md",
+      "kind": "question_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "Inline-Questions/question-05.md",
+      "kind": "question_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "LabGuidePackage/Lab Guide/Lab Guide/Exercise-01.md",
+      "kind": "exercise_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "LabGuidePackage/Lab Guide/Lab Guide/Exercise-02.md",
+      "kind": "exercise_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "LabGuidePackage/Lab Guide/Lab Guide/Exercise-03.md",
+      "kind": "exercise_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "LabGuidePackage/Lab Guide/Lab Guide/GettingStarted-V2.md",
+      "kind": "getting_started",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "permissions/CustomIAMPolicy/aws-scp.json",
+      "kind": "policy_json",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "permissions/CustomIAMPolicy/iam-custom-policy.json",
+      "kind": "policy_json",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "README.md",
+      "kind": "readme_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "solution-guide/solution.md",
+      "kind": "solution_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "Spec.md",
+      "kind": "spec_md",
+      "lintStatus": "passed"
+    },
+    {
+      "path": "Validations/02-task-freepdb1-datafile-recovery.sh",
+      "kind": "validation_sh",
+      "lintStatus": "warn"
+    },
+    {
+      "path": "Validations/Backup Chain and Whole-CDB PITR.sh",
+      "kind": "validation_sh",
+      "lintStatus": "warn"
+    },
+    {
+      "path": "Validations/FREEPDB1 Plan and RMAN Schedule.sh",
+      "kind": "validation_sh",
+      "lintStatus": "warn"
+    }
+  ],
+  "errors": [],
+  "coherence": [
+    {
+      "severity": "info",
+      "rule": "coherence-validation-step-unmatched",
+      "message": "Validation step \"3\" has no clearly-matching validation script under Validations/. Confirm a backing .ps1/.sh exists.",
+      "artifactPath": "LabGuidePackage/Lab Guide/Lab Guide/Exercise-03.md"
+    }
+  ],
+  "runnability": {
+    "issues": [],
+    "blocking": 0,
+    "warning": 0,
+    "info": 0
+  }
+}

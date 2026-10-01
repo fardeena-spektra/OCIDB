@@ -1,0 +1,109 @@
+{
+  "Version": "2012-10-17",
+  "Description": "Identity-based IAM policy containing explicit Deny guardrails for the Oracle Backup, Recovery & Diagnostics lab. This document is NOT an AWS Organizations Service Control Policy (SCP), is not attached to an organization or account, and must be attached to the candidate IAM user, group, or role. The legacy aws-scp.json filename is retained for package compatibility.",
+  "Statement": [
+    {
+      "Sid": "DenyRequestsOutsideLabRegion",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+    {
+      "Sid": "DenyNonT3Instances",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "ec2:InstanceType": "t3.*"
+        }
+      }
+    },
+    {
+      "Sid": "DenyUnencryptedEbsVolumes",
+      "Effect": "Deny",
+      "Action": "ec2:CreateVolume",
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "ec2:Encrypted": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyUnencryptedEbsAtInstanceLaunch",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "ec2:Encrypted": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyChangesToProtectedIamRoles",
+      "Effect": "Deny",
+      "Action": [
+        "iam:DeleteRole",
+        "iam:UpdateRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "iam:RoleName": [
+            "OrganizationAccountAccessRole",
+            "AWSReservedSSO_*",
+            "CloudLabsProtected-*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyChangesToProtectedIamPolicies",
+      "Effect": "Deny",
+      "Action": [
+        "iam:DeletePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "iam:PolicyName": [
+            "AdministratorAccess",
+            "AWSOrganizationsFullAccess",
+            "CloudLabsProtected-*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyProtectedControlPlaneTampering",
+      "Effect": "Deny",
+      "Action": [
+        "cloudformation:DeleteStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:UpdateStackSet",
+        "cloudformation:DeleteStackSet"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/CloudLabsProtected": "true"
+        }
+      }
+    }
+  ]
+}

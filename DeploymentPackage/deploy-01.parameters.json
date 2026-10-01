@@ -1,0 +1,24 @@
+{
+  "Parameters": [
+    {
+      "ParameterKey": "AdminCidr",
+      "ParameterValue": "0.0.0.0/0"
+    },
+    {
+      "ParameterKey": "VMUserName",
+      "ParameterValue": "oraclelab"
+    },
+    {
+      "ParameterKey": "VMPassword",
+      "ParameterValue": "GEN-PASSWORD"
+    },
+    {
+      "ParameterKey": "InstanceType",
+      "ParameterValue": "t3.large"
+    },
+    {
+      "ParameterKey": "BootstrapScriptUrl",
+      "ParameterValue": "https://experienceazure.blob.core.windows.net/templates/cloudlabs-common/oracle-backup-recovery-diagnostics/userdata-01.sh"
+    }
+  ]
+}
