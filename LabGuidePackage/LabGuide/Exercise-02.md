@@ -277,7 +277,7 @@ Confirm that these evidence files contain actual output:
 
 Then run Exercise 2 validation from the lab interface.
 
-<validation step="2"></validation>
+<validation step="138f3b74-e42f-4ed6-a6b4-8aab175d31a1"></validation>
 
 Validation 2 is independent of Validation 1. It can pass when Exercise 1 failed or was never completed, and it accepts recovery based on either a pre-existing usable current-incarnation level 0 or the safety level 0 created by `/opt/lab/inject-ex2.sh`. That acceptance applies only to Exercise 2 recovery; it does not award any Exercise 1 backup/PITR points.
 
