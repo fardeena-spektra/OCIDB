@@ -283,7 +283,7 @@ Your evidence must support all of these conclusions:
 
 Validation step 3 is backed by the exact package path `Validations/FREEPDB1 Plan and RMAN Schedule.sh`. The external validator uses AWS Systems Manager Run Command to inspect host, container, Oracle, evidence, scheduler, and log state; allow time for Systems Manager's eventual consistency.
 
-<validation step="3" />
+<validation step="682f7e85-022d-4536-a772-1a73a5b94584" />
 
 ## Exercise summary
 
