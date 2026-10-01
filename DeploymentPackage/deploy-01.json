@@ -78,7 +78,7 @@
     },
     "BootstrapScriptUrl": {
       "Type": "String",
-      "Default": "https://raw.githubusercontent.com/fardeena-spektra/OCIDB/refs/heads/main/Userdata/userdata.sh",
+      "Default": "https://raw.githubusercontent.com/fardeena-spektra/OCIDB/refs/heads/main/DeploymentPackage/Scripts/userdata.sh",
       "AllowedPattern": "^https://.+/userdata[.]sh(?:[?].*)?$",
       "ConstraintDescription": "Provide an HTTPS URL for the canonical userdata.sh Bash artifact.",
       "Description": "Canonical standalone Amazon Linux 2023 bootstrap. The script owns normal failure trapping, readiness, and final success signaling."
