@@ -1,248 +1,389 @@
 # Facilitator Solution — Oracle Backup, Recovery & Diagnostics
 
-## Use of this guide
+## Scope and operating contract
 
-This is the facilitator key for plan v3. It is intentionally outcome-oriented: candidates may use equivalent RMAN, SQL*Plus, Linux, systemd, or cron commands. Accept evidence only when it is reproducible and tied to the provisioned instance and `FREEPDB1`; pasted output, recreated rows, or hard-coded verification results do not earn credit.
+This guide implements **plan v5**. The runtime is Oracle Database Free in Docker on Amazon Linux 2023, not a native Oracle installation on the EC2 host. Award equivalent commands only when they produce equivalent Oracle/RMAN evidence.
 
-The environment is Oracle Database Free on an EC2 `t3.large`. The seeded AWR/ASH-style files are simulations and must be described as such. Oracle Database Free does not provide licensed AWR/ASH generation. Live corroboration must use execution plans, elapsed/runtime observations, SQL and dynamic performance views, and RMAN output.
+The approved image is:
 
-## Facilitator readiness and AWS checks
+```text
+container-registry.oracle.com/database/free:23.9.0.0
+sha256:66296e93ffe793012d424439db5771617491e94c782196953d993ffd869c3eb0
+```
 
-Before a session, confirm the stack is in `us-east-1`, the EC2 instance is running, the SSM agent is online, and the separate backup volume is attached and mounted. AWS CLI commands below use the documented AWS CLI form: region is explicit, `describe-volumes` is a direct EC2 call, and guest commands use Systems Manager Run Command. Replace local shell variables; do not place credentials in the guide or in SSM command strings.
+The tag is pinned; `latest` is not an acceptable substitute. Bootstrap must pull the pinned tag, inspect the resolved repository digest, record it in `/opt/oracle-image-digest.txt`, and fail on a digest mismatch. A fresh registry pull test is required before publication because registry tags can be republished or retired.
+
+The container must remain present and running throughout the lab. Oracle shutdown, startup, mount, restore, recover, and open operations occur inside that container. Candidates must not stop, remove, recreate, or replace `oracle-free`, delete persistent database directories, or recreate rows instead of performing RMAN recovery.
+
+Every host script and validator dynamically resolves exactly one intended running container:
+
+```bash
+ids=$(docker ps --filter name=oracle-free --filter status=running -q)
+count=$(printf '%s\n' "$ids" | sed '/^$/d' | wc -l)
+test "$count" -eq 1
+CONTAINER_ID=$(printf '%s\n' "$ids" | sed '/^$/d')
+```
+
+A hard-coded container ID is not acceptable. The stable name may be used after the uniqueness check. The AWR/ASH-style reports are explicitly simulated evidence; do not describe them as Oracle-generated licensed AWR/ASH.
+
+## AWS and host readiness
+
+The AWS checks below use standard CloudFormation, EC2, and Systems Manager APIs. Always specify the deployment Region. `send-command` is asynchronous; poll `get-command-invocation` to a terminal status before judging the guest result.
 
 ```bash
 export AWS_REGION=us-east-1
-export STACK=your-stack-name
-export INSTANCE_ID=$(aws cloudformation describe-stacks --region "$AWS_REGION" \
-  --stack-name "$STACK" --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' \
-  --output text)
+export STACK=lab-stack-name
+INSTANCE_ID=$(aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK" \
+  --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text)
+BACKUP_VOLUME_ID=$(aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK" \
+  --query 'Stacks[0].Outputs[?OutputKey==`BackupVolumeId`].OutputValue' --output text)
 
 aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK" \
   --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' --output json
 aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" \
-  --query 'Reservations[0].Instances[0].{State:State.Name,Type:InstanceType,AZ:Placement.AvailabilityZone,Subnet:SubnetId}'
+  --query 'Reservations[0].Instances[0].{State:State.Name,Type:InstanceType,AZ:Placement.AvailabilityZone}' --output table
+aws ec2 describe-volumes --region "$AWS_REGION" --volume-ids "$BACKUP_VOLUME_ID" \
+  --query 'Volumes[0].{Id:VolumeId,Type:VolumeType,GiB:Size,Encrypted:Encrypted,State:State,Attachments:Attachments}' --output json
 aws ssm describe-instance-information --region "$AWS_REGION" \
   --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-  --query 'InstanceInformationList[0].{Ping:PingStatus,Agent:AgentVersion,Platform:PlatformName}'
-aws ec2 describe-volumes --region "$AWS_REGION" \
-  --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" \
-            "Name=tag:Name,Values=*backup*" \
-  --query 'Volumes[].{Id:VolumeId,Type:VolumeType,GiB:Size,Encrypted:Encrypted,State:State,Attachments:Attachments}' \
-  --output json
+  --query 'InstanceInformationList[0].{Ping:PingStatus,Agent:AgentVersion,Platform:PlatformName}' --output table
 ```
 
-If the volume has no identifying tag, discover it by the CloudFormation output/resource or by `describe-volumes` filtered on the instance attachment, then inspect all returned volumes. The expected result is one separate in-use encrypted `gp3`, 30-GiB volume. `describe-volumes` is deliberately run directly from the validator/facilitator shell, not through SSM.
+Expected control-plane evidence is an attached, in-use, encrypted, 30-GiB `gp3` backup volume and an EC2 instance of the deployed type (default `t3.large`). Guest evidence must additionally show `/u02/backup` mounted from that volume, `/u01/oradata` available, numeric ownership `54321:54321`, Docker active, exactly one running `oracle-free`, and a healthy CDB/PDB.
 
-A guest check can be sent with Run Command. `send-command` returns a command ID; it is not synchronous, so poll `get-command-invocation` until a terminal status. The instance role needs `AmazonSSMManagedInstanceCore`; the caller needs the relevant SSM actions.
+Use SSM for guest checks; do not infer readiness from EC2 `running` alone:
 
 ```bash
-CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["set -eu","findmnt /u02/backup","df -h /u02/backup","systemctl is-active amazon-ssm-agent"]' \
+COMMAND_ID=$(aws ssm send-command --region "$AWS_REGION" \
+  --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
+  --parameters 'commands=["set -eu","findmnt /u02/backup","findmnt /u01/oradata || true","systemctl is-active docker","systemctl is-active amazon-ssm-agent","cat /opt/oracle-image-digest.txt","docker ps --filter name=oracle-free --filter status=running","test -f /opt/lab/.ready"]' \
   --query 'Command.CommandId' --output text)
-aws ssm get-command-invocation --region "$AWS_REGION" \
-  --command-id "$CMD" --instance-id "$INSTANCE_ID" \
-  --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}'
+for i in $(seq 1 18); do
+  status=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$COMMAND_ID" \
+    --instance-id "$INSTANCE_ID" --query Status --output text)
+  case "$status" in Success|Failed|Cancelled|TimedOut|Cancelling) break;; esac
+  sleep 10
+done
+aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$COMMAND_ID" \
+  --instance-id "$INSTANCE_ID" --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' --output json
 ```
 
-For a slow or `Pending` result, poll rather than declaring failure. An instance can be `running` before bootstrap, Oracle listener, or SSM registration is ready. A missing SSM target is not fixed by repeatedly sending commands; inspect the agent service, instance profile, route/egress, DNS, and IAM propagation.
+The EC2 role should contain `AmazonSSMManagedInstanceCore`. AL2023 is expected to provide SSM Agent and `/opt/aws/bin/cfn-signal`; bootstrap verifies rather than installs them. CloudFormation success requires the readiness signal, not merely an instance launch.
 
-## Expected evidence package
+## Common command contract
 
-At minimum, collect these artifacts under the lab evidence location and preserve the original injection records:
-
-- RMAN `SHOW ALL`, `LIST BACKUP SUMMARY`, `LIST BACKUP OF DATABASE`, archived-log listing, `CROSSCHECK`, and validation output.
-- Level 0 and level 1 piece names, sizes, completion times, archived redo coverage, and control-file/SPFILE protection.
-- Exercise 1 target SCN/time, injected transaction marker, `RESETLOGS` output, new incarnation, post-resetlogs backup, and SQL showing the bad row absent while pre-target rows remain.
-- Exercise 2 injection record, `v$datafile`/`v$recover_file`/`v$recovery_status` evidence with container context, RMAN restore/recover transcript, and row/checksum comparison.
-- Exercise 3 seeded report references, baseline and post-statistics plans/metrics, object statistics timestamps, checksum output, and the verification script, schedule, and successful log.
-
-Exact filenames may vary. Evidence must include UTC timestamps, database identity, PDB name, and enough command text to establish provenance.
-
-# Exercise 1 — Full/incremental backup and whole-CDB SCN PITR
-
-## Task 1: establish baseline
-
-**Expected answer/end state.** The candidate connects to the CDB as an authorized recovery user, confirms `ARCHIVELOG`, confirms `FREEPDB1` is open or can be opened, verifies `/u02/backup` is the separate writable filesystem, and records the RMAN configuration. The database and PDB are healthy before injection.
-
-Accept equivalent checks using `v$database`, `v$pdbs`, `v$datafile`, `v$log`, `df`, `findmnt`, and RMAN `SHOW ALL`. The backup destination must be deterministic and point to `/u02/backup`; control-file autobackup must be enabled.
-
-**Rubric.** Full credit: all health, mode, mount, capacity, write, and configuration evidence is captured (2%). Partial: database health is shown but archive mode, mount identity, or RMAN settings are missing (1%). No credit: work starts without establishing the baseline.
-
-**Common pitfalls.** Checking only `CDB$ROOT`; confusing a directory on the root EBS volume with the backup EBS; using a relative RMAN format; proceeding while `FREEPDB1` is mounted or the listener is not ready.
-
-## Task 2: create the backup chain
-
-**Expected answer/end state.** The candidate creates a CDB level 0 backup to `/u02/backup`, includes archived redo and control-file/SPFILE protection, then runs the supplied workload change and creates a level 1 incremental with enough archived redo. A valid, physical chain is visible both in RMAN metadata and on disk.
-
-A valid pattern is conceptually:
-
-```text
-RMAN TARGET /
-CONFIGURE CONTROLFILE AUTOBACKUP ON;
-BACKUP DATABASE PLUS ARCHIVELOG TAG 'LAB_L0';
--- run the supplied workload change
-BACKUP INCREMENTAL LEVEL 1 DATABASE PLUS ARCHIVELOG TAG 'LAB_L1';
-LIST BACKUP SUMMARY;
-LIST BACKUP OF DATABASE;
-LIST BACKUP OF ARCHIVELOG ALL;
+```bash
+docker exec -it oracle-free sqlplus / as sysdba
+docker exec -it oracle-free rman target /
 ```
 
-The candidate may use explicit `FORMAT '/u02/backup/...%U'`, `BACKUP CURRENT CONTROLFILE`, and `BACKUP SPFILE` instead of relying on configuration, provided the resulting chain is usable. Do not require a particular backup-set count or tag.
+Use `/u02/backup` for RMAN paths inside the container. Use `/u01/oradata` only when inspecting the host-side bind mount. Capture `V$DATABASE`, `V$PDBS`, `V$DATAFILE`, `V$RECOVER_FILE`, RMAN metadata, physical files, and protected injection evidence rather than relying on a single assertion.
 
-**Rubric.** Full: level 0, level 1, redo, control file/SPFILE, and usable physical pieces are proven (12%). Partial: a database backup exists but the incremental, redo coverage, or control-file protection is not proven (6–9%). A database copy or SQL export is not an RMAN chain.
+# Exercise 1 — Full/incremental backup and whole-CDB PITR (35%)
 
-**Common pitfalls.** Running the level 1 before the level 0; omitting archived redo; putting pieces on `/`; confusing `BACKUP DATABASE` with `BACKUP CDB`; not checking free space; using `DELETE INPUT` and destroying evidence; assuming `LIST BACKUP` proves files still exist without `CROSSCHECK`.
+## Task 1 — Baseline and RMAN configuration
 
-## Task 3: inject and identify the recovery target
+**Expected end state:** CDB identity, current SCN, `ARCHIVELOG` mode, open `FREEPDB1`, datafile status, `/u02/backup` mount, Docker bind mounts, and RMAN configuration are recorded. Control-file autobackup is enabled and RMAN disk output is under `/u02/backup`.
 
-**Expected answer/end state.** `sudo /opt/lab/inject-ex1.sh` is run once. The facilitator must see the script's target SCN and unique bad-transaction marker in the protected audit record. The candidate verifies the marker in `FREEPDB1`, after the target SCN was recorded. The target is an SCN, not merely a wall-clock guess.
+```bash
+docker exec -i oracle-free sqlplus -s / as sysdba <<'SQL'
+set pages 100 lines 200
+select dbid,name,log_mode,open_mode,current_scn from v$database;
+select con_id,name,open_mode,restricted from v$pdbs order by con_id;
+select con_id,file#,name,status,enabled from v$datafile order by con_id,file#;
+exit
+SQL
+docker exec -i oracle-free rman target / <<'RMAN'
+show all;
+report schema;
+exit
+RMAN
+findmnt /u02/backup
+docker inspect oracle-free --format '{{json .Mounts}}'
+```
 
-**Rubric.** Full: target, UTC time, PDB, and marker are preserved and independently verified (3%). Partial: target exists but marker or PDB context is absent (1–2%). No credit for modifying the injection log.
+**Rubric:** Full (2%): all health, storage, bind-mount, archive-mode, and RMAN facts are evidenced. Partial (1%): database is healthy but one category is missing. No credit for beginning recovery without a baseline.
 
-**Common pitfalls.** Running the script as a non-root user; running it twice; connecting to `CDB$ROOT` and querying the application schema without changing container; selecting the SCN after the bad transaction.
+**Pitfalls:** checking only `CDB$ROOT`; confusing a directory on the root disk with the EBS mount; using host RMAN; using a relative or container-layer backup destination.
 
-## Task 4: perform whole-CDB SCN PITR
+## Task 2 — Level 0, level 1, and redo protection
 
-**Expected answer/end state.** The candidate uses RMAN connected to the CDB, restores/recover the whole database to the recorded SCN, and opens the CDB with `RESETLOGS`. A typical sequence is equivalent to:
+**Expected end state:** a whole-CDB level 0, a later whole-CDB level 1, archived redo spanning the exercise, and control-file/SPFILE protection exist physically under `/u02/backup` and in RMAN metadata. Equivalent tags are valid.
+
+```bash
+docker exec -i oracle-free rman target / <<'RMAN'
+configure controlfile autobackup on;
+configure channel device type disk format '/u02/backup/rman_%U';
+backup database plus archivelog tag 'LAB_L0';
+list backup summary;
+exit
+RMAN
+# After a workload change:
+docker exec -i oracle-free rman target / <<'RMAN'
+backup incremental level 1 database plus archivelog tag 'LAB_L1';
+backup current controlfile tag 'LAB_CONTROLFILE';
+backup spfile tag 'LAB_SPFILE';
+list backup summary;
+list backup of archivelog all;
+exit
+RMAN
+```
+
+**Rubric:** Full (12%): level 0 (4%), level 1 (4%), spanning redo (2%), control-file/SPFILE protection plus physical pieces (2%). Partial (6–9%): a usable backup exists but one chain component is unproven. SQL exports, filesystem copies, and clones do not earn RMAN-chain credit.
+
+**Pitfalls:** level 1 before level 0; no archived redo; `DELETE INPUT`; writing to the container writable layer; assuming `LIST BACKUP` proves files are present without `CROSSCHECK`; filling the 30-GiB volume.
+
+## Task 3 — Inject and preserve the target SCN
+
+**Expected end state:** the candidate runs `sudo /opt/lab/inject-ex1.sh` once, preserves the protected target SCN and UTC timestamp, and proves the unique bad transaction exists in `FREEPDB1`. The state file is not edited.
+
+**Rubric:** Full (3%): target SCN, time, PDB, and marker provenance are independently shown. Partial (1–2%): target is identifiable but corroboration is incomplete.
+
+**Pitfalls:** running as a non-root user; recording the SCN after the transaction; querying the marker while still in root; rerunning or modifying the injection record.
+
+## Task 4 — Whole-CDB PITR and RESETLOGS
+
+**Expected end state:** using the recorded SCN, the candidate performs CDB-level restore and recovery inside the still-running container, then opens with `RESETLOGS`. The bad marker is absent while pre-target committed data remains.
+
+```bash
+docker exec -it oracle-free rman target /
+```
+
+Expected RMAN/SQL sequence (with the protected SCN substituted):
 
 ```text
 SHUTDOWN IMMEDIATE;
 STARTUP MOUNT;
 RUN {
-  SET UNTIL SCN target_scn_from_injection_record;
+  SET UNTIL SCN <target_scn>;
   RESTORE DATABASE;
   RECOVER DATABASE;
 }
 ALTER DATABASE OPEN RESETLOGS;
 ```
 
-If the candidate uses `SET UNTIL TIME` only, award at most partial credit: the task target is the recorded SCN. After opening, the candidate opens `FREEPDB1` read/write as appropriate, saves its state, verifies the bad transaction is absent, and verifies earlier committed data remains. The entire CDB, not just the PDB, is recovered; all datafiles are consistent with the target.
-
-**Rubric.** Full: correct target SCN, CDB-level restore/recovery, `RESETLOGS`, PDB health, and data assertions (15%). Partial: correct recovery but time-based or PDB-only procedure, or missing data assertions (8–12%). No credit for deleting the bad row manually, recreating data, or restoring only the application schema.
-
-**Common pitfalls.** Forgetting `STARTUP MOUNT`; recovering only `FREEPDB1`; using the current SCN instead of the recorded one; not restoring archived redo; opening normally after incomplete recovery; using a post-target backup without explaining why; not checking the alert log after `RESETLOGS`.
-
-## Task 5: prove incarnation handling and create a new backup
-
-**Expected answer/end state.** RMAN `LIST INCARNATION` shows a new current incarnation after `OPEN RESETLOGS`. The candidate creates a new usable CDB backup after resetlogs, preferably including archived redo and control-file/SPFILE protection. The post-resetlogs backup is not optional operationally: it establishes a recovery base for the new incarnation.
-
-**Rubric.** Full: new incarnation and post-resetlogs backup are both independently evidenced (8%). Partial: `RESETLOGS` occurred but no usable new backup, or the candidate cannot explain incarnation selection (3–5%).
-
-**Common pitfalls.** Continuing to rely only on pre-resetlogs pieces; not cataloging or crosschecking the post-resetlogs pieces; confusing database incarnation with PDB open state; deleting the only usable post-resetlogs backup.
-
-# Exercise 2 — FREEPDB1 training datafile recovery
-
-## Task 1: diagnose the incident and choose scope
-
-**Expected answer/end state.** After `sudo /opt/lab/inject-ex2.sh`, the candidate identifies the exact training datafile from the protected injection record, container-aware views, alert/log evidence, and the filesystem. They explain that only a dedicated `FREEPDB1` training file was removed. PDB/datafile-scoped recovery is preferable because it minimizes outage and avoids replacing healthy root, system, undo, temp, and application files.
-
-Useful evidence includes `CDB_DATA_FILES`/`V$DATAFILE` with `CON_ID`, `V$RECOVER_FILE`, `V$DATABASE`, `V$PDBS`, RMAN `REPORT SCHEMA`, `LIST BACKUP OF DATAFILE`, alert log entries, and `findmnt`/`ls` output. SQL must be executed in the correct PDB or use explicit `CON_ID` filtering.
-
-**Rubric.** Full: exact file, PDB, offline/missing status, backup availability, and least-disruptive scope are proven (8%). Partial: file is found but container identity or scope rationale is weak (4–6%). **Common pitfalls.** Treating an OS-missing file as a dropped tablespace; querying only root views and overlooking `CON_ID`; restoring every database file; attempting to recover `SYSTEM`, `SYSAUX`, or undo; editing or recreating the file with SQL instead of RMAN.
-
-## Task 2: restore and recover only the training file
-
-**Expected answer/end state.** The candidate sets RMAN context for the affected PDB/datafile, restores the named file from the post-resetlogs-compatible backup, and recovers it with archived redo. Equivalent approaches using RMAN `SET PDB`, `RESTORE DATAFILE`, `RECOVER DATAFILE`, or a correctly scoped `ALTER SESSION SET CONTAINER` plus RMAN syntax are acceptable. The tablespace/PDB is returned online/open without unnecessary CDB restore.
-
-The exact file number and path are intentionally instance-specific. Do not award for a guessed path. The transcript must show the actual file selected from the injection record and RMAN metadata.
-
-**Rubric.** Full: targeted restore and recovery complete, correct PDB context is explicit, and only necessary disruption occurs (12%). Partial: file is restored and data is present but scope/context is not demonstrated, or the candidate unnecessarily takes the whole CDB down (6–9%). No credit for manual file creation or copying a datafile outside RMAN.
-
-**Common pitfalls.** Restoring from the obsolete pre-`RESETLOGS` incarnation; forgetting archived redo; running RMAN while the wrong PDB is selected; bringing a file online before media recovery; confusing `RECOVER DATABASE` with targeted `RECOVER DATAFILE`.
-
-## Task 3: prove integrity and return to service
-
-**Expected answer/end state.** The training datafile is present and online, `FREEPDB1` opens correctly, `V$RECOVER_FILE` is empty for required files, and the seeded row/checksum markers match the pre-loss values. The injection record remains unchanged. Evidence includes before/after file identity, RMAN restore/recover output, PDB state, and deterministic SQL checks.
-
-**Rubric.** Full: online/no-media-recovery-needed, PDB-open, data/checksum, and preserved-record evidence (5%). Partial: PDB opens and rows appear but no no-recovery-needed or checksum proof (2–3%). **Common pitfalls.** Verifying only that the filename exists; overlooking read-only/open state; accepting a row count alone when the expected checksum is available; modifying the protected marker to make it match.
-
-# Exercise 3 — SQL regression and automated backup verification
-
-## Task 1: diagnose the regression
-
-**Expected answer/end state.** The candidate identifies the dominant seeded SQL and distinguishes the seeded AWR/ASH-style observations: poor cardinality estimates/stale or missing statistics on affected `FREEPDB1` objects, disproportionate logical/physical I/O, and a suboptimal access path. They do not claim the reports were generated by Oracle Database Free.
-
-A defensible diagnosis correlates report SQL ID/object/wait information with a live reproduction in `FREEPDB1`, `DBMS_XPLAN.DISPLAY_CURSOR` or equivalent plan output, elapsed time/buffer statistics, row estimates versus actual rows, and dynamic views. CPU-only, locking, or latch pressure must not be asserted unless live evidence supports it.
-
-**Rubric.** Full: report findings are clearly labeled simulated, dominant SQL and object are identified, cardinality/I/O mechanism is explained, and live corroboration is supplied (8%). Partial: stale statistics and a bad plan are named but no live correlation, or waits are misclassified (4–6%). **Common pitfalls.** Calling a simulated report “AWR”; tuning from elapsed time alone on a noisy `t3.large`; blaming locks because a wait appears in a report; using root-owned objects; changing SQL text or adding hints before testing statistics.
-
-## Task 2: gather targeted statistics and prove improvement
-
-**Expected answer/end state.** The candidate gathers targeted optimizer statistics only for the affected objects in `FREEPDB1`, using appropriate `DBMS_STATS` calls and a justified method/degree/sample. They capture before and after `DBA_TAB_STATISTICS`/`ALL_TAB_STATISTICS` timestamps and plan output. The query returns the same checksum/result while showing a measurably better access path and stable improvement metric such as buffers or logical reads; absolute elapsed thresholds should account for instance variance.
-
-An acceptable pattern is a PDB-local connection followed by `DBMS_STATS.GATHER_TABLE_STATS` for the identified owner/table and, where justified, index statistics or column/histogram statistics. Gathering statistics for the entire CDB, using undocumented optimizer changes, or changing application data is not targeted tuning.
-
-**Rubric.** Full: correct PDB scope/object scope (4%), plan/access-path improvement with measured support (4%), result checksum preserved (2%), and before/after statistics evidence (2%). Partial: statistics are fresh and plan changes but no stable metric/checksum, or broad statistics collection was used (4–8%). No credit for a cosmetic plan change with a changed result.
-
-**Common pitfalls.** Gathering stats in `CDB$ROOT`; gathering the wrong owner/table; comparing different bind values; trusting `EXPLAIN PLAN` without an executed cursor; treating a changed plan as proof of improvement; changing schema/data or forcing a hint.
-
-## Task 3: build and schedule verification automation
-
-**Expected answer/end state.** The executable Bash program under an approved location performs RMAN `CROSSCHECK`, reports expired/missing pieces, runs a non-destructive restore validation such as `RESTORE ... VALIDATE`/`VALIDATE BACKUPSET`, writes timestamped logs under `/u02/backup`, exits nonzero on any failure, prevents overlap with `flock` or an equivalent lock, and never emits a hard-coded success. It does not overwrite backup pieces or evidence.
-
-A robust implementation has `set -Eeuo pipefail`, an absolute Oracle environment, a lock file, a unique log name, tee/redirected output, explicit RMAN error handling, and a final status derived from command results. A systemd service plus timer or a cron entry is acceptable. The candidate runs it once manually and proves a recent successful log and an enabled schedule.
-
-**Rubric.** Full: crosscheck (2%), restore validation (2%), timestamped protected logs and no overwrite (2%), failure propagation (2%), overlap prevention (1%), enabled schedule and successful run (1%). Partial: script works once but lacks locking, nonzero propagation, or scheduling (3–7%). No credit for `echo SUCCESS` without RMAN result inspection.
-
-**Common pitfalls.** Running RMAN as the wrong OS user; relying on a login shell for `ORACLE_SID`/`ORACLE_HOME`; using a log path on the root filesystem; cron’s minimal `PATH`; overlapping long validations; swallowing RMAN status with `|| true`; validating only metadata rather than backup contents; writing logs world-writable.
-
-# Overall rubric and adjudication
-
-| Area | Full-credit standard | Weight |
-|---|---|---:|
-| Exercise 1 | Valid CDB level 0/incremental chain (12%), correct whole-CDB SCN PITR and data result (15%), `RESETLOGS`/incarnation and new backup (8%) | 35% |
-| Exercise 2 | PDB-aware diagnosis and scope (8%), targeted file restore/recovery (12%), integrity/no-media-recovery evidence (5%) | 25% |
-| Exercise 3 | Defensible diagnosis (8%), targeted statistics and measured correct improvement (12%), robust scheduled verification (10%) | 30% |
-| Operational quality | Safe commands, preserved evidence, least privilege/security awareness, no protected-control bypass | 10% |
-
-A passing submission must pass all three validators. Fabricated evidence, manual data recreation in place of RMAN, disabled controls, or hard-coded success is a fail condition regardless of raw score. Deduct operational-quality credit for widening SSH ingress, exposing credentials in logs/commands, changing root-owned injection scripts, or altering IAM guardrails. Do not deduct for equivalent valid syntax or a different but demonstrably safe schedule.
-
-# Troubleshooting decision tree
-
-## Stack or instance is not ready
-
-- **Stack `CREATE_IN_PROGRESS`:** wait for the EC2 CreationPolicy signal; inspect CloudFormation events and the instance console/system log. Do not manually signal success.
-- **`CREATE_FAILED` or timeout:** inspect `/var/log/cloud-init-output.log`, bootstrap logs, and the CloudFormation failure reason. Common causes are Oracle RPM/repository drift, insufficient egress, wrong AMI mapping, disk device timing, or failure to locate the pip-installed `cfn-signal`.
-- **Wrong region/no AMI:** use `--region us-east-1`; the template intentionally supports the mapped region only. Do not substitute a nonexistent SSM public AMI parameter.
-- **SSM `TargetNotConnected`:** confirm instance profile attachment, `amazon-ssm-agent` installed and active, DNS/route/HTTPS egress, and IAM propagation. An EC2 `running` state does not imply SSM readiness.
-- **SSH failure:** confirm the security-group ingress CIDR, public address, route/IGW, effective `sshd` configuration, and the username. Do not broaden access beyond the disposable-lab requirement.
-
-## Backup and recovery failures
-
-- **RMAN cannot find pieces:** run `CROSSCHECK`, inspect `/u02/backup` mount and permissions, catalog only known legitimate files, and verify the correct incarnation. Do not invent or copy pieces.
-- **Missing redo:** identify the required sequence/SCN range and restore archived logs from the valid chain; check that `PLUS ARCHIVELOG` was actually taken.
-- **`OPEN RESETLOGS` fails:** remain mounted, inspect RMAN/alert output, verify incomplete recovery reached the target and all required files are recovered. Never force-open by deleting files.
-- **PDB will not open:** check `V$PDBS`, `V$DATAFILE`, `V$RECOVER_FILE`, alert log, and file state in the correct container. A PDB datafile incident should not trigger a whole-CDB restore.
-- **Exercise 2 restores the wrong file:** stop, compare file number/path/`CON_ID` to the protected injection record and RMAN `REPORT SCHEMA`, then restart with explicit PDB/datafile scope.
-
-## Tuning or automation failures
-
-- **Plan changed but result differs:** reject the result, restore the intended data state if the candidate changed it, and rerun with identical binds/inputs; checksum is authoritative.
-- **No improvement:** confirm stats were gathered for the actual affected owner/table in `FREEPDB1`, compare executed cursor plans and buffers, and account for cache/t3 variance. Do not require a particular plan hash if the access path and stable metric improve.
-- **Cron works manually only:** set absolute `ORACLE_HOME`, `ORACLE_SID`, `PATH`, and log paths; run as the Oracle OS account; capture stderr and exit status.
-- **Verification says success after RMAN failure:** inspect `set -o pipefail`, RMAN exit handling, and lock logic. A log line is not proof; the scheduler and validator must observe the nonzero status.
-
-## AWS-specific facilitator pitfalls
-
-- A globally unique S3 bucket name is irrelevant here: backups are EBS-only; do not add S3 permissions or silently redesign the exercise.
-- IAM policy changes can take time to propagate. Retry only after inspecting the denied action, region, resource, and condition; do not remove explicit denies.
-- Explicit denies override allows. If stack creation, `iam:PassRole`, `ec2:DescribeVolumes`, SSM registration, or validators fail, inspect policy conditions and the expected lab tags/path.
-- EC2 state, CloudFormation state, SSM registration, listener readiness, and `.ready` are separate milestones. Treat them separately.
-- Validate direct EC2 volume properties from the facilitator/validator account, not from an SSM command that could be tampered with by the guest.
-- Lambda cold-start guidance is not applicable to this package; do not introduce Lambda merely to poll or validate the EC2 host.
-
-## Final manual acceptance commands
-
 ```bash
-aws cloudformation describe-stack-events --region us-east-1 --stack-name "$STACK" \
-  --query 'StackEvents[?ResourceStatus==`CREATE_FAILED` || ResourceStatus==`UPDATE_FAILED`].[LogicalResourceId,ResourceStatusReason]' \
-  --output table
-aws ec2 describe-volumes --region us-east-1 --volume-ids "$BACKUP_VOLUME_ID" \
-  --query 'Volumes[0].{Type:VolumeType,Size:Size,Encrypted:Encrypted,State:State,AZ:AvailabilityZone}'
-aws ssm describe-instance-information --region us-east-1 \
-  --filters "Key=InstanceIds,Values=$INSTANCE_ID" --output table
-# Use the send-command/get-command-invocation pattern above for final guest checks.
+docker ps --filter name=oracle-free --filter status=running
+docker exec -i oracle-free sqlplus -s / as sysdba <<'SQL'
+select name,open_mode,resetlogs_change#,resetlogs_time from v$database;
+select con_id,name,open_mode from v$pdbs;
+alter pluggable database FREEPDB1 open read write;
+alter pluggable database FREEPDB1 save state;
+exit
+SQL
 ```
 
-The final facilitator decision is based on the three validator results plus the preserved evidence set. AWS control-plane observations establish the correct instance, volume, region, attachment, encryption, and SSM path; Oracle/RMAN observations establish recovery and tuning correctness; neither evidence source substitutes for the other.
+**Rubric:** Full (15%): target SCN (3%), CDB-level restore/recover (5%), `RESETLOGS` (3%), container continuity (2%), PDB/data assertions (2%). Partial (8–12%): valid recovery with missing proof, a time target, or incorrect granularity. Deleting the marker, recreating rows, or stopping/removing the container earns no recovery credit.
+
+**Pitfalls:** running RMAN on the host; forgetting MOUNT; using a current SCN; missing redo; opening without `RESETLOGS`; confusing a stopped listener with a stopped container.
+
+## Task 5 — New incarnation and post-resetlogs backup
+
+**Expected end state:** `LIST INCARNATION` shows the current post-`RESETLOGS` incarnation, and a fresh post-resetlogs database/redo/control-file backup is usable.
+
+```bash
+docker exec -i oracle-free rman target / <<'RMAN'
+list incarnation;
+backup database plus archivelog tag 'LAB_POST_RESETLOGS';
+backup current controlfile tag 'LAB_POSTRESET_CONTROLFILE';
+list backup summary;
+exit
+RMAN
+```
+
+**Rubric:** Full (8%): new incarnation and usable post-resetlogs protection. Partial (3–5%): resetlogs occurred but the new recovery base is missing or unexplained.
+
+**Pitfalls:** relying only on pre-resetlogs pieces; failing to crosscheck; confusing PDB open state with an RMAN incarnation.
+
+# Exercise 2 — Independent FREEPDB1 datafile recovery (25%)
+
+## Independence, warning, and safety behavior
+
+Exercise 2 is independently attemptable. `sudo /opt/lab/inject-ex2.sh` requires only general readiness, mounted backup storage, and one healthy dynamically resolved container. It must not require Exercise 1 success or even an Exercise 1 state file.
+
+If Exercise 1 evidence exists but PITR/`RESETLOGS` cannot be proven, the injector records a warning to stderr and the protected injection audit log, then continues. This warning is not an Exercise 1 failure adjudication and must not prevent Exercise 2.
+
+Before deleting the training datafile, the injector determines the current incarnation and checks RMAN metadata and physical pieces for a usable current-incarnation whole-CDB level 0. If none exists, it creates and verifies an independent **safety level 0**, archived redo, and control-file/SPFILE protection. Failure to create that safety backup aborts the injection before file deletion. The safety backup is a recovery precondition, not candidate work.
+
+The evidence must identify provenance, for example `learner-created` versus `injector-created`. Do not award Exercise 1 backup or PITR points for an injector-created safety level 0. Score Exercise 2 recovery separately and accept either a pre-existing usable current-incarnation level 0 or the injector-created safety level 0.
+
+The injector offlines and removes only the dedicated training datafile in `FREEPDB1`; it never targets system, root, undo, temp, control, redo, or unrelated application files.
+
+## Task 1 — Diagnose and establish scope
+
+**Expected end state:** after `sudo /opt/lab/inject-ex2.sh`, the candidate reads `/opt/lab/evidence/ex2`, identifies the exact file number, PDB, checksum, Oracle path, host bind path, incarnation, and backup provenance, and corroborates the loss through Oracle and RMAN views.
+
+```bash
+sudo find /opt/lab/evidence/ex2 -maxdepth 2 -type f -ls
+docker exec -i oracle-free sqlplus -s / as sysdba <<'SQL'
+select con_id,file#,name,status,enabled from v$datafile order by con_id,file#;
+select con_id,file#,error,online_status from v$recover_file;
+select con_id,name,open_mode from v$pdbs;
+alter session set container=FREEPDB1;
+select tablespace_name,file_name,online_status from dba_data_files;
+exit
+SQL
+docker exec -i oracle-free rman target / <<'RMAN'
+list incarnation;
+report schema;
+list backup of database;
+exit
+RMAN
+findmnt /u01/oradata
+```
+
+**Rubric:** Full (8%): exact file/PDB, missing state, current-incarnation backup/provenance, checksum, and least-disruptive scope. Partial (4–6%): file identified but path or scope rationale is weak.
+
+**Pitfalls:** querying only root without `CON_ID`; guessing paths; treating loss as a dropped tablespace; restoring the whole CDB; changing protected evidence; confusing the safety backup with candidate Exercise 1 work.
+
+## Task 2 — Targeted restore and recovery
+
+**Expected end state:** RMAN inside the running container restores and recovers only the recorded training datafile, using a current-incarnation usable backup. The candidate brings only the affected datafile/tablespace online in the correct PDB context.
+
+```bash
+docker exec -it oracle-free rman target /
+```
+
+```text
+LIST BACKUP OF DATAFILE <training_file_number>;
+RUN {
+  RESTORE DATAFILE <training_file_number>;
+  RECOVER DATAFILE <training_file_number>;
+}
+```
+
+**Rubric:** Full (12%): targeted restore (5%), targeted media recovery (4%), correct PDB/file context and no replacement of the database (3%). Partial (6–9%): data returns but scope is weak or unnecessary broader interruption occurs. No credit for `CREATE DATAFILE`, copying a file, or recreating rows.
+
+**Pitfalls:** obsolete incarnation; wrong file number; missing redo; host path supplied to RMAN; bringing the file online before recovery; stopping Docker.
+
+## Task 3 — Integrity and service restoration
+
+**Expected end state:** the restored file exists at the expected bind mount, is online, `FREEPDB1` is read/write, `V$RECOVER_FILE` has no pending requirement for it, RMAN validation succeeds, and the checksum matches the protected pre-loss evidence. Injection records remain unchanged.
+
+```bash
+docker exec -i oracle-free sqlplus -s / as sysdba <<'SQL'
+select con_id,file#,name,status,enabled from v$datafile order by con_id,file#;
+select con_id,file#,error,online_status from v$recover_file;
+select con_id,name,open_mode from v$pdbs;
+exit
+SQL
+docker exec -i oracle-free rman target / <<'RMAN'
+crosscheck datafile <training_file_number>;
+validate datafile <training_file_number>;
+exit
+RMAN
+```
+
+**Rubric:** Full (5%): file/PDB state, no media recovery pending, checksum/row integrity, RMAN validation, and preserved evidence. Partial (2–3%): rows appear but state or checksum is missing.
+
+**Pitfalls:** checking only a filename; accepting read-only PDB state; validating a different file; treating row count alone as checksum integrity.
+
+# Exercise 3 — Diagnose, tune, and automate (30%)
+
+## Task 1 — Diagnose the regression
+
+**Expected end state:** the candidate identifies the seeded SQL, dominant object, cardinality error, and excess logical/physical I/O; labels the supplied report simulated; and corroborates it in live `FREEPDB1` execution.
+
+Acceptable evidence includes an executed cursor and `DBMS_XPLAN.DISPLAY_CURSOR(NULL,NULL,'ALLSTATS LAST +PEEKED_BINDS')`, plus `V$SQL`, `V$SQL_PLAN_STATISTICS_ALL`, and PDB-local table statistics. `EXPLAIN PLAN` alone is insufficient.
+
+**Rubric:** Full (8%): simulated provenance (2%), SQL/object and cardinality mechanism (3%), live plan/runtime/I/O evidence (3%). Partial (4–6%): stale statistics is asserted without live correlation.
+
+**Pitfalls:** calling simulated reports AWR; blaming CPU or locking without wait evidence; changing inputs between runs; running in root; relying on one noisy elapsed measurement.
+
+## Task 2 — Targeted statistics and measurable improvement
+
+**Expected end state:** in `FREEPDB1`, statistics are gathered only for the evidenced owner/table and justified related columns/indexes. Before/after plans, statistics timestamps, identical inputs/results, checksum, and a stable resource improvement are retained.
+
+```sql
+ALTER SESSION SET CONTAINER=FREEPDB1;
+BEGIN
+  DBMS_STATS.GATHER_TABLE_STATS(
+    ownname=>'<seeded_owner>', tabname=>'<affected_table>',
+    estimate_percent=>DBMS_STATS.AUTO_SAMPLE_SIZE,
+    method_opt=>'FOR ALL COLUMNS SIZE AUTO',
+    cascade=>DBMS_STATS.AUTO_CASCADE);
+END;
+/
+```
+
+**Rubric:** Full (12%): correct PDB/object scope (4%), fresh targeted statistics (2%), measured access-path/resource improvement (4%), identical result checksum (2%). Partial (4–8%): fresh statistics and plan change without stable measurement/checksum, or unnecessarily broad collection. A changed plan hash alone is not improvement.
+
+**Pitfalls:** gathering CDB-wide statistics; wrong owner; changing binds; cold/warm comparison; hints or undocumented parameters; data modification; cosmetic plan change.
+
+## Task 3 — Scheduled RMAN verification
+
+**Expected end state:** an executable host Bash job dynamically finds exactly one running container, prevents overlap, logs under `/u02/backup`, runs RMAN crosscheck and non-destructive validation, propagates failures, and is enabled on a schedule with an authentic successful run.
+
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+exec 9>/u02/backup/.rman-verify.lock
+flock -n 9 || exit 75
+log=/u02/backup/verify-$(date -u +%Y%m%dT%H%M%SZ).log
+exec > >(tee -a "$log") 2>&1
+ids=$(docker ps --filter name=oracle-free --filter status=running -q)
+test "$(printf '%s\n' "$ids" | sed '/^$/d' | wc -l)" -eq 1
+docker exec -i oracle-free rman target / <<'RMAN'
+set echo on;
+crosscheck backup;
+restore database validate;
+validate backup;
+exit
+RMAN
+echo "verification succeeded $(date -u +%FT%TZ)"
+```
+
+**Rubric:** Full (10%): discovery (2%), crosscheck (2%), non-destructive validation (2%), logs/failure propagation (2%), lock (1%), enabled schedule and successful run (1%). Partial (3–7%): manual run works but schedule, lock, or exit propagation is absent. No credit for hard-coded success or container ID.
+
+**Pitfalls:** host RMAN; cron PATH differences; root-disk logs; `|| true`; swallowed `docker exec` failure; overlapping jobs; destructive restore; metadata-only validation.
+
+# Scoring, provenance, and fail conditions
+
+| Area | Weight |
+|---|---:|
+| Exercise 1: chain, whole-CDB SCN PITR, incarnation, post-resetlogs backup | 35% |
+| Exercise 2: diagnosis, targeted datafile recovery, integrity | 25% |
+| Exercise 3: diagnosis, targeted statistics, scheduled verification | 30% |
+| Operational quality and preserved evidence | 10% |
+
+Score each exercise from its own evidence. Exercise 2 receives its 25% even when Exercise 1 failed, provided its independent injection/recovery evidence is correct. Conversely, injector-created safety backups are never retroactively awarded Exercise 1 points. Record backup provenance explicitly (`learner-created` or `injector-created`) and keep warning/audit records separate from candidate evidence.
+
+Fabricated or edited evidence, altered injection scripts, manual data recreation, stopping/removing the container, hard-coded IDs, hard-coded success, or widening protected access is a fail condition regardless of numerical score.
+
+# Facilitator troubleshooting
+
+## Bootstrap and image
+
+- **CloudFormation waits or fails:** inspect stack events, `/var/log/cloudlabs-bootstrap.log`, cloud-init, and the EC2 system log. Common causes include Oracle Container Registry terms/authentication, DNS or HTTPS egress, device discovery timing, missing preinstalled `cfn-signal`/SSM Agent, and image digest drift. Do not manually signal success.
+- **Digest mismatch:** stop publication or deployment. Confirm the exact pinned tag, architecture, registry pull result, and `/opt/oracle-image-digest.txt`; never replace the approved digest with a newly observed value silently. The pinned release-test digest is `sha256:66296e93ffe793012d424439db5771617491e94c782196953d993ffd869c3eb0`.
+- **SSM `TargetNotConnected`:** verify instance-profile attachment, IAM propagation, agent service/binary, DNS, and HTTPS egress. EC2 `running`, CloudFormation completion, SSM online, Docker readiness, and `/opt/lab/.ready` are separate milestones.
+- **Wrong Region:** pass `--region "$AWS_REGION"` to every AWS CLI call. A missing stack, volume, instance, or SSM target in another Region is not absence.
+- **IAM denied:** inspect the action, Region, resource, `iam:PassRole`, and condition keys. Explicit identity-based denies override allows; do not remove guardrails. IAM changes can take time to propagate.
+
+## Storage, Docker, and Oracle
+
+- **Backup volume wrong or absent:** verify direct `aws ec2 describe-volumes` output, then `findmnt /u02/backup`, UUID, and ownership. Never format a populated device or assume `/dev/nvme1n1`.
+- **No container/SQL failure:** check `systemctl is-active docker`, `docker ps -a --filter name=oracle-free`, and `docker logs --tail 100 oracle-free`. A running container does not prove Oracle listener/database readiness. Do not recreate it.
+- **RMAN cannot find pieces:** distinguish host `/u01/oradata` from container `/u02/backup`; verify mount, ownership, `CROSSCHECK`, physical files, and current incarnation. Do not invent or copy pieces.
+- **PITR fails:** verify target SCN, MOUNT state, archived redo, incarnation, and all-file recovery. Keep Docker running; do not force open or delete files.
+- **Exercise 2 appears blocked by Exercise 1:** inspect the injector audit warning and provenance. The injector must continue after a non-proven PITR warning and create a current-incarnation level 0 only when needed. If the safety backup failed, injection must have aborted before deletion; fix readiness/storage rather than bypassing the guard.
+- **PDB/datafile remains unavailable:** query `V$PDBS`, `V$DATAFILE`, and `V$RECOVER_FILE` with `CON_ID`. Confirm only the training file was targeted and that media recovery is complete.
+- **Tuning result is inconclusive:** repeat identical inputs with comparable warm-up, capture executed-cursor statistics, and use buffer gets/logical reads as a stable metric. Do not accept plan hash alone.
+
+## AWS control-plane notes
+
+This lab uses EBS for backup storage and does not require S3 or Lambda. S3 bucket-name uniqueness and Lambda cold starts are therefore irrelevant troubleshooting branches. EC2 `running` can lag application readiness; CloudFormation completion can lag or precede SSM registration; and SSM command submission can succeed while the remote command later fails. Poll the invocation and inspect both stdout and stderr.
+
+## Final manual acceptance
+
+```bash
+aws cloudformation describe-stack-events --region "$AWS_REGION" --stack-name "$STACK" \
+  --query 'StackEvents[?ResourceStatus==`CREATE_FAILED` || ResourceStatus==`UPDATE_FAILED`].[LogicalResourceId,ResourceStatusReason]' --output table
+aws ec2 describe-volumes --region "$AWS_REGION" --volume-ids "$BACKUP_VOLUME_ID" \
+  --query 'Volumes[0].{Type:VolumeType,GiB:Size,Encrypted:Encrypted,State:State,AZ:AvailabilityZone}' --output table
+aws ssm describe-instance-information --region "$AWS_REGION" \
+  --filters "Key=InstanceIds,Values=$INSTANCE_ID" --output table
+```
+
+Make the final decision from direct AWS control-plane evidence, SSM/host evidence, Oracle/RMAN evidence, protected injection provenance, and the three validator results. None substitutes for the others.

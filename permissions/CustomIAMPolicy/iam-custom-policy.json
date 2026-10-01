@@ -2,32 +2,22 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "CloudFormationDeploymentLifecycle",
+      "Sid": "CloudFormationDeployment",
       "Effect": "Allow",
-      "Action": [
-        "cloudformation:CreateStack",
-        "cloudformation:UpdateStack",
-        "cloudformation:DeleteStack",
-        "cloudformation:DescribeStacks",
-        "cloudformation:DescribeStackEvents",
-        "cloudformation:DescribeStackResources",
-        "cloudformation:ListStackResources",
-        "cloudformation:GetTemplate",
-        "cloudformation:ValidateTemplate"
-      ],
+      "Action": "cloudformation:*",
       "Resource": "*"
     },
     {
-      "Sid": "LabNetworkAndComputeLifecycle",
+      "Sid": "VpcAndSecurityGroupProvisioning",
       "Effect": "Allow",
       "Action": [
-        "ec2:RunInstances",
-        "ec2:TerminateInstances",
-        "ec2:StopInstances",
-        "ec2:StartInstances",
         "ec2:CreateVpc",
         "ec2:DeleteVpc",
         "ec2:ModifyVpcAttribute",
+        "ec2:CreateInternetGateway",
+        "ec2:DeleteInternetGateway",
+        "ec2:AttachInternetGateway",
+        "ec2:DetachInternetGateway",
         "ec2:CreateSubnet",
         "ec2:DeleteSubnet",
         "ec2:ModifySubnetAttribute",
@@ -38,65 +28,90 @@
         "ec2:CreateRoute",
         "ec2:ReplaceRoute",
         "ec2:DeleteRoute",
-        "ec2:CreateInternetGateway",
-        "ec2:DeleteInternetGateway",
-        "ec2:AttachInternetGateway",
-        "ec2:DetachInternetGateway",
         "ec2:CreateSecurityGroup",
         "ec2:DeleteSecurityGroup",
         "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
         "ec2:RevokeSecurityGroupIngress",
-        "ec2:CreateVolume",
-        "ec2:DeleteVolume",
-        "ec2:AttachVolume",
-        "ec2:DetachVolume",
+        "ec2:RevokeSecurityGroupEgress",
         "ec2:CreateTags",
         "ec2:DeleteTags"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "LabReadOnlyDiscovery",
+      "Sid": "Ec2AndEncryptedEbsProvisioning",
       "Effect": "Allow",
       "Action": [
-        "ec2:DescribeAvailabilityZones",
-        "ec2:DescribeImages",
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "ec2:StopInstances",
+        "ec2:StartInstances",
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceAttribute",
         "ec2:DescribeInstanceStatus",
-        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeImages",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSecurityGroups",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeTags",
-        "ec2:DescribeVolumeStatus",
+        "ec2:DescribeInternetGateways",
+        "ec2:DescribeAvailabilityZones",
         "ec2:DescribeVolumes",
-        "ec2:DescribeVpcs"
+        "ec2:DescribeVolumeStatus",
+        "ec2:CreateVolume",
+        "ec2:DeleteVolume",
+        "ec2:AttachVolume",
+        "ec2:DetachVolume",
+        "ec2:ModifyVolume",
+        "ec2:CreateSnapshot",
+        "ec2:DeleteSnapshot",
+        "ec2:DescribeSnapshots"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "LabInstanceRolePlumbing",
+      "Sid": "IamRolesAndInstanceProfilesForStack",
       "Effect": "Allow",
       "Action": [
         "iam:CreateRole",
-        "iam:GetRole",
         "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:TagRole",
+        "iam:UntagRole",
         "iam:AttachRolePolicy",
         "iam:DetachRolePolicy",
+        "iam:ListAttachedRolePolicies",
         "iam:CreateInstanceProfile",
-        "iam:GetInstanceProfile",
         "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
         "iam:AddRoleToInstanceProfile",
         "iam:RemoveRoleFromInstanceProfile",
-        "iam:PassRole"
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile",
+        "iam:ListInstanceProfilesForRole"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "RestrictPassRoleToEc2",
+      "Sid": "AttachOnlyApprovedManagedPolicies",
+      "Effect": "Allow",
+      "Action": "iam:AttachRolePolicy",
+      "Resource": "*",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PolicyARN": [
+            "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+            "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "PassOnlyEc2InstanceRole",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::*:role/*",
+      "Resource": "*",
       "Condition": {
         "StringEquals": {
           "iam:PassedToService": "ec2.amazonaws.com"
@@ -104,76 +119,41 @@
       }
     },
     {
-      "Sid": "ScopedSsmCommandAndSessionAccess",
+      "Sid": "ReadDeploymentAndIamMetadata",
       "Effect": "Allow",
       "Action": [
-        "ssm:SendCommand",
-        "ssm:ListCommands",
-        "ssm:ListCommandInvocations",
-        "ssm:GetCommandInvocation",
-        "ssm:CancelCommand",
-        "ssm:StartSession",
-        "ssm:ResumeSession",
-        "ssm:TerminateSession",
-        "ssm:DescribeInstanceInformation",
-        "ssm:GetConnectionStatus"
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "ssm:GetParameter",
+        "ssm:DescribeParameters"
       ],
-      "Resource": [
-        "arn:aws:ec2:us-east-1:*:instance/*",
-        "arn:aws:ssm:us-east-1:*:document/AWS-RunShellScript",
-        "arn:aws:ssm:us-east-1:*:document/AWS-StartInteractiveCommand",
-        "arn:aws:ssm:us-east-1:*:session/*"
-      ]
+      "Resource": "*"
     },
     {
-      "Sid": "DenyIamPrivilegeEscalation",
+      "Sid": "DenyIamSelfModify",
       "Effect": "Deny",
       "Action": [
         "iam:CreateUser",
         "iam:DeleteUser",
         "iam:AttachUserPolicy",
+        "iam:DetachUserPolicy",
         "iam:PutUserPolicy",
+        "iam:DeleteUserPolicy",
         "iam:CreateAccessKey",
+        "iam:UpdateAccessKey",
+        "iam:CreateLoginProfile",
         "iam:UpdateLoginProfile",
+        "iam:DeleteLoginProfile",
+        "iam:CreatePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:DeletePolicyVersion",
         "iam:AttachGroupPolicy",
         "iam:PutGroupPolicy",
-        "iam:CreatePolicyVersion",
-        "iam:SetDefaultPolicyVersion"
+        "iam:CreateGroup",
+        "iam:DeleteGroup"
       ],
       "Resource": "*"
-    },
-    {
-      "Sid": "DenyNonUsEast1",
-      "Effect": "Deny",
-      "Action": "*",
-      "Resource": "*",
-      "Condition": {
-        "StringNotEqualsIfExists": {
-          "aws:RequestedRegion": "us-east-1"
-        }
-      }
-    },
-    {
-      "Sid": "DenyNonT3Instances",
-      "Effect": "Deny",
-      "Action": "ec2:RunInstances",
-      "Resource": "*",
-      "Condition": {
-        "StringNotLikeIfExists": {
-          "ec2:InstanceType": "t3.*"
-        }
-      }
-    },
-    {
-      "Sid": "DenyUnencryptedEbsVolume",
-      "Effect": "Deny",
-      "Action": "ec2:CreateVolume",
-      "Resource": "*",
-      "Condition": {
-        "Bool": {
-          "ec2:Encrypted": "false"
-        }
-      }
     }
   ]
 }

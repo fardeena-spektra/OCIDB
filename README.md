@@ -1,229 +1,204 @@
 # Oracle Backup, Recovery & Diagnostics
 
-This package provisions a disposable, task-based Oracle recovery and diagnostics assessment on AWS. Learners prove an RMAN backup chain, perform whole-CDB recovery to an injected SCN, recover a removed `FREEPDB1` training datafile, diagnose a seeded SQL regression, gather targeted optimizer statistics, and automate RMAN verification.
+This AWS package provisions a disposable, intermediate Oracle Database Free assessment on Amazon Linux 2023. Learners create and prove an RMAN backup chain, perform whole-CDB point-in-time recovery, independently recover a removed `FREEPDB1` datafile, diagnose a query regression from simulated AWR/ASH-style evidence, improve its plan with targeted optimizer statistics, and automate Docker-aware RMAN verification.
 
-## Deployment summary
+The three exercises are independently scored. Exercise 2 remains attemptable if Exercise 1 is incomplete or unsuccessful; an injector-created safety backup may support Exercise 2 but earns no Exercise 1 credit.
 
-The single CloudFormation stage is intentionally limited to **`us-east-1`**. It creates:
+## Canonical deployment artifacts
 
-- A VPC, public subnet, internet gateway, public route, route table, and security group.
-- One x86-64 Oracle Linux 9 EC2 instance. `InstanceType` defaults to **`t3.large`** and allows `t3.medium`, `t3.large`, or `t3.xlarge`.
-- An encrypted 50 GiB gp3 root volume.
-- A separate encrypted 30 GiB gp3 EBS volume mounted by filesystem UUID at `/u02/backup`.
-- An EC2 IAM role and instance profile with `AmazonSSMManagedInstanceCore`.
-- Password SSH on TCP 22 from `AdminCidr`.
-- IMDSv2 with tokens required and metadata hop limit 1.
-- Oracle Database Free with CDB `FREE`, PDB `FREEPDB1`, ARCHIVELOG mode, deterministic RMAN settings, seeded workload, and diagnostic assets.
+- `DeploymentPackage/deploy-01.json` — the single AWS CloudFormation stage.
+- `DeploymentPackage/deploy-01.parameters.json` — CloudLabs parameter bindings.
+- `DeploymentPackage/Scripts/userdata.sh` — the canonical, self-contained Amazon Linux 2023 bootstrap, with Unix LF line endings and `#!/bin/bash` as line one.
 
-The EC2 resource has a 90-minute `CreationPolicy`. Bootstrap creates `/opt/lab/.ready` and calls `cfn-signal` only after Oracle, the listener, `FREEPDB1`, `/u02/backup`, SSH, injection-script permissions, and SSM Agent pass readiness checks.
+`DeploymentPackage/Scripts/userdata-01.sh`, if it remains in the package, is a legacy artifact only. Do not publish it as the bootstrap, reference it from CloudFormation or the parameter file, or use it in deployment instructions. The canonical published bootstrap is always `DeploymentPackage/Scripts/userdata.sh`.
 
-## Oracle Linux 9 and Oracle prerequisites
+## PAYNOTIFY-compatible CloudFormation contract
 
-Complete these checks before publication:
+### Parameters
 
-1. **Oracle Linux AMI:** `DeploymentPackage/deploy-01.json` currently maps `us-east-1` to Oracle owner `131827586825`, AMI `ami-0dd239e274077553a` (`OL9.3-x86_64-HVM-2024-02-02`). The template metadata marks current availability unresolved. Revalidate it with `ec2:DescribeImages` and deployment-test it. Do not silently substitute a third-party image.
-2. **Oracle Database Free:** the Bash bootstrap is pinned to Oracle Database Free 23ai for EL9, RPM `oracle-database-free-23ai-1.0-1.el9.x86_64.rpm`, under `/opt/oracle/product/23ai/dbhomeFree`. Confirm that Oracle still publishes the preinstall package and database RPM and that both work on the selected OL9 image. Oracle package documentation may have advanced to a newer release; surface incompatibility rather than silently changing the OS or database version.
-3. **Internet egress:** bootstrap needs Oracle repositories/downloads, Oracle Linux repositories, the Region-local SSM Agent S3 endpoint, and the AWS CloudFormation Python helper archive.
-4. **Bootstrap URL:** `DeploymentPackage/deploy-01.parameters.json` currently points `BootstrapScriptUrl` at a `.ps1` URL, but the package bootstrap is `DeploymentPackage/Scripts/userdata-01.sh`. Publish the Bash file at an HTTPS URL and correct this parameter before launch.
-5. **End-to-end test:** verify package installation, database creation, seed placement, backup-volume mounting, `cfn-signal`, SSM registration, and all validation paths in a disposable account.
+The template exposes these exact parameter names:
 
-The template has only a `us-east-1` AMI mapping, so use in another Region fails rather than choosing an unverified image.
+- `CloudLabsDeploymentID` — `String`; identifies the CloudLabs deployment and participates in resource Name tags.
+- `CheckAcknowledgement` — `String`; default `TRUE`; allowed values `TRUE` and `FALSE`.
+- `AmazonECSTaskExecutionRolePolicy` — `String`; default `arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy`.
+- `VMUserName` — Linux user created for lab access.
+- `VMPassword` — `NoEcho` password used for lab SSH. It is intentionally returned in Outputs; Outputs are not secret storage.
+- `AdminCidr` — IPv4 CIDR for the normal SSH security group; default `0.0.0.0/0` for this disposable lab.
+- `InstanceType` — EC2 instance type; default `t3.large`.
+- `BootstrapScriptUrl` — HTTPS location of the standalone bootstrap; default `https://raw.githubusercontent.com/fardeena-spektra/OCIDB/refs/heads/main/Userdata/userdata.sh`.
 
-## Password-output and SSH warning
+The parameter file must bind these PAYNOTIFY parameters and must not reference `userdata-01.sh`.
 
-`AdminCidr` defaults to `0.0.0.0/0`, and password SSH is enabled. This is an intentionally insecure disposable-lab default; narrow the CIDR before launch whenever possible.
+### Resources and naming
 
-`VMPassword` is declared `NoEcho`, but the template intentionally returns it in the `VMPassword` and `vmServerPassword` stack outputs. **CloudFormation outputs are not a secret store.** AWS documents that `NoEcho` does not redact values placed in `Outputs`. Anyone able to inspect stack outputs can obtain this password. Use the package only in an isolated, short-lived account, do not export the password output, and delete the stack after use.
+The stage creates:
 
-Bootstrap must not use shell tracing or expose the password in logs, readiness markers, command history, or SSM output.
+- A VPC, internet gateway, gateway attachment, public subnet, route table, default internet route, and subnet route-table association.
+- A normal VM security group for password SSH from `AdminCidr`.
+- `clgSg`, a second security group with unrestricted IPv4 and IPv6 ingress and egress, as required by the PAYNOTIFY pattern.
+- An EC2 IAM role and instance profile. The role trusts `ec2.amazonaws.com` and attaches `AmazonSSMManagedInstanceCore`.
+- `TaskExecutionRole`, which trusts `ecs-tasks.amazonaws.com` for `sts:AssumeRole` and attaches the managed policy ARN supplied by `AmazonECSTaskExecutionRolePolicy`.
+- One Amazon Linux 2023 EC2 instance whose logical resource is `LabVm` and whose `Name` tag is exactly `labvm`.
+- An encrypted gp3 root volume and a separate encrypted 30 GiB gp3 EBS backup volume.
 
-## SSM and IAM setup
+The VPC, internet gateway, subnet, route table, and security-group Name tags include `${CloudLabsDeploymentID}`. The EC2 instance remains exactly `labvm`, enabling guides and validators to locate it consistently.
 
-The instance role trusts `ec2.amazonaws.com`, is attached with an instance profile, and uses the AWS managed `AmazonSSMManagedInstanceCore` policy. It has no S3 backup access because RMAN data remains on EBS.
+The instance uses this Region-local AWS public Systems Manager parameter dynamic reference for `ImageId`:
 
-Oracle Linux is not assumed to include SSM Agent. UserData downloads and installs the official x86-64 RPM from the Region-local AWS S3 endpoint before enabling or restarting `amazon-ssm-agent`. Outbound HTTPS and DNS are required for installation and Systems Manager registration.
+```text
+{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}
+```
 
-The deployment/candidate IAM policy supplies CloudFormation and EC2 lifecycle operations, EC2 describe calls, role/profile plumbing, `iam:PassRole`, and Systems Manager command/session access. Validation 1 calls `aws ec2 describe-volumes` directly; guest and Oracle checks run through SSM Run Command.
+Its encrypted gp3 root volume is mapped as `/dev/xvda`; persistent Oracle data is stored under `/u01/oradata`. The separate encrypted 30 GiB gp3 volume is discovered from `BACKUP_VOLUME_ID` by its normalized NVMe EBS serial and mounted at `/u02/backup`.
 
-The explicit-deny document restricts non-`us-east-1` requests, non-`t3` launches, unencrypted EBS creation, IAM privilege escalation, and protected-resource changes. Explicit deny overrides allow, so test the combined policies against stack creation and deletion, role passing, SSM registration, direct `ec2:DescribeVolumes`, and every validator.
+`LabVm` retains `CreationPolicy.ResourceSignal.Timeout` set to `PT60M`. CloudFormation therefore waits for one resource signal before considering instance creation complete.
 
-Despite its existing path, `permissions/CustomIAMPolicy/aws-scp.json` is used by this package as an IAM explicit-deny policy document, not as an AWS Organizations SCP.
+### Exact outputs
 
-## AWS documentation references
+The PAYNOTIFY outputs are exactly:
 
-Recheck current AWS guidance and live API behavior before release:
+- `CloudLabsDeploymentID`
+- `AWSAccountID`
+- `Region`
+- `VpcId`
+- `vmSubnetId`
+- `vmSecurityGroupId`
+- `clusterSecurityGroupId`
+- `TaskExecutionRole` — the ECS task execution role ARN
+- `InstanceId`
+- `VMName` — `labvm`
+- `VMPublicIP`
+- `VMPrivateIP`
+- `VMPublicDNSName`
+- `VMPrivateDNSName`
+- `VMUserName`
+- `VMPassword`
 
-- CloudFormation `NoEcho` caveat: <https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/parameters-section-structure.html>
-- Creation policies: <https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-attribute-creationpolicy.html>
-- `cfn-signal`: <https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/cfn-signal.html>
-- SSM Agent on Oracle Linux: <https://docs.aws.amazon.com/systems-manager/latest/userguide/agent-install-ol.html>
-- `AmazonSSMManagedInstanceCore`: <https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AmazonSSMManagedInstanceCore.html>
-- EC2 instance profiles: <https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2_instance-profiles.html>
-- IMDS options: <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-options.html>
-- EBS encryption: <https://docs.aws.amazon.com/ebs/latest/userguide/ebs-encryption.html>
-- gp3 volumes: <https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html>
-- IAM evaluation and deny precedence: <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html>
+The retained Oracle-specific outputs are exactly:
 
-Static AMI identifiers and external package URLs can become stale; current documentation and live API results take precedence.
+- `BackupVolumeId`
+- `BackupMount`
+- `OracleContainerName`
+- `OracleServices`
+- `OracleListenerPort`
+- `SSMTarget`
 
-## Simulated AWR/ASH disclosure
+Legacy output names `PublicIPv4` and `PublicDnsName` are removed. Consumers must use `VMPublicIP` and `VMPublicDNSName`. Do not add aliases for the removed names.
 
-Oracle Database Free in this lab does **not** generate licensed AWR or ASH reports. These assets are clearly labeled training simulations:
+## UserData download and signaling contract
 
-- `/opt/lab/diagnostics/seeded-awr-style-report.txt`
-- `/opt/lab/diagnostics/seeded-ash-style-report.txt`
+The CloudFormation UserData wrapper performs only the download handoff and pre-execution checks:
 
-They must never be described as Oracle-generated AWR/ASH output. Learners use them only as diagnostic leads and corroborate them with live execution plans, runtime measurements, result checksums, `V$SQL`, `V$SQL_PLAN`, and available non-AWR dynamic performance views in `FREEPDB1`.
+1. Export the deployment ID, stack name, `LabVm` resource name, VM username and password, AWS Region, and backup-volume ID required by the standalone script, without printing secrets.
+2. Download `BootstrapScriptUrl` to a protected local file.
+3. If `curl` fails, immediately run `/opt/aws/bin/cfn-signal --success false` for resource `LabVm` with a nonsecret reason, then exit nonzero.
+4. Verify that the downloaded file begins with `#!/bin/bash`, preserve or normalize Unix LF handling, make the file executable, and run it.
+5. Do not send a second success signal from the wrapper. After a successful download, `userdata.sh` owns normal failure trapping, readiness checks, and the one final success signal.
 
-## Artifact inventory
+This division prevents a failed download from waiting for the full 60-minute creation-policy timeout while also preventing duplicate success signals.
+
+## Canonical standalone bootstrap
+
+`DeploymentPackage/Scripts/userdata.sh` is complete and self-contained. It provides:
+
+- strict error handling and verbose, nonsecret logging to `/var/log/cloudlabs-bootstrap.log` without shell tracing;
+- creation of `VMUserName`, membership in `wheel` and `docker`, password assignment, password-SSH configuration validation, and `sshd` restart;
+- NVMe serial discovery for `BACKUP_VOLUME_ID` and persistent mounting at `/u02/backup`;
+- `/u01/oradata` creation with numeric UID/GID `54321` ownership;
+- Docker installation and startup;
+- pull and digest verification for `container-registry.oracle.com/database/free:23.9.0.0` against approved x86-64 repository digest `sha256:66296e93ffe793012d424439db5771617491e94c782196953d993ffd869c3eb0`;
+- secure creation and readiness of container `oracle-free`, ARCHIVELOG and RMAN configuration, and `FREEPDB1` seeding below 2 GiB;
+- complete generation of `/opt/lab/inject-ex1.sh` and independent `/opt/lab/inject-ex2.sh`;
+- proof that database shutdown, mount, and recovery operations do not stop the Docker container;
+- final enable/restart of SSM Agent;
+- creation of `/opt/lab/.ready` only after readiness succeeds;
+- a `/opt/aws/bin/cfn-signal` failure trap and exactly one final success signal.
+
+The persistent Docker bind mounts are:
+
+```text
+/u01/oradata:/opt/oracle/oradata
+/u02/backup:/u02/backup
+```
+
+Recovery changes database state inside the still-running container. Learners and automation must not stop or remove the container.
+
+## Access and security risks
+
+This deployment intentionally uses insecure conventions suitable only for a short-lived, isolated lab:
+
+- `AdminCidr` defaults to `0.0.0.0/0`, exposing password SSH to all IPv4 sources.
+- `clgSg` permits unrestricted IPv4 and IPv6 ingress and egress.
+- `VMPassword` is marked `NoEcho` but is intentionally included in stack Outputs. CloudFormation Outputs are not a secret store, and `NoEcho` does not protect a value placed in Outputs.
+- Membership in the `docker` group is effectively root-equivalent.
+
+Narrow `AdminCidr` and remove the open `clgSg`, password Outputs, password SSH, and Docker-group access in any non-lab implementation.
+
+IAM guardrails in this package are identity-based explicit `Deny` statements, not an AWS Organizations service control policy. Applicable explicit denies override allows. Candidate/deployment permissions include the constrained IAM create, tag, delete, and pass-role operations required for both the EC2 role and `TaskExecutionRole`.
+
+## Exercise model
+
+- **Exercise 1 — Full/incremental backup and whole-CDB PITR (35 minutes):** create level 0/1 backups, inject a transaction, recover the whole CDB to the target SCN, open with `RESETLOGS`, verify `FREEPDB1`, and create a post-resetlogs backup.
+- **Exercise 2 — Independent `FREEPDB1` datafile recovery (30 minutes):** run the independent injector regardless of Exercise 1 outcome, diagnose the removed training file, restore and recover only that datafile, and prove integrity.
+- **Exercise 3 — Diagnose, tune, and automate (30 minutes):** analyze simulated reports, corroborate live evidence, gather targeted statistics, prove improvement, and schedule Docker-aware RMAN verification.
+
+The AWR/ASH-style reports are training simulations, not Oracle-generated AWR or ASH output.
+
+## Package inventory
 
 ### Deployment
 
-- `DeploymentPackage/deploy-01.json` — CloudFormation JSON template.
-- `DeploymentPackage/deploy-01.parameters.json` — CloudFormation parameter values.
-- `DeploymentPackage/Scripts/userdata-01.sh` — Oracle Linux Bash bootstrap and seed logic.
+- `DeploymentPackage/deploy-01.json`
+- `DeploymentPackage/deploy-01.parameters.json`
+- `DeploymentPackage/Scripts/userdata.sh`
 
-### Lab guide
+### Learning and assessment
 
 - `LabGuidePackage/Lab Guide/Lab Guide/GettingStarted-V2.md`
 - `LabGuidePackage/Lab Guide/Lab Guide/Exercise-01.md`
 - `LabGuidePackage/Lab Guide/Lab Guide/Exercise-02.md`
 - `LabGuidePackage/Lab Guide/Lab Guide/Exercise-03.md`
-
-### Questions
-
-- `Inline-Questions/question-01.md`
-- `Inline-Questions/question-02.md`
-- `Inline-Questions/question-03.md`
-- `Inline-Questions/question-04.md`
-- `Inline-Questions/question-05.md`
-
-### Validations
-
-- `Validations/Backup Chain and Whole-CDB PITR.sh`
-- `Validations/02-task-freepdb1-datafile-recovery.sh`
-- `Validations/FREEPDB1 Plan and RMAN Schedule.sh`
-
-The existing validators use Bash, AWS CLI, direct EC2 API calls, and SSM Run Command. Package lint warns that CloudLabs inline validation registration supports PowerShell V2 and Python rather than Bash. Convert them to a supported format before publication if they must run through the inline validation service.
-
-### Solution, permissions, and package documents
-
+- `Inline-Questions/question-01.md` through `Inline-Questions/question-05.md`
 - `solution-guide/solution.md`
-- `permissions/CustomIAMPolicy/iam-custom-policy.json`
-- `permissions/CustomIAMPolicy/aws-scp.json`
-- `README.md`
-- `Spec.md`
 
-## Static validation commands
+### Validation and permissions
 
-Run from the package root with AWS CLI v2, `jq`, and ShellCheck installed:
+- Three AWS CLI/SSM Bash validators under `Validations/`
+- IAM allow and identity-based explicit-Deny policy artifacts under `permissions/`
+
+If `DeploymentPackage/Scripts/userdata-01.sh` remains physically present, it is legacy-only and is deliberately excluded from the canonical deployment inventory.
+
+## Release checks
+
+Validate the template and canonical script from the package root:
 
 ```bash
 export AWS_REGION=us-east-1
-
 aws cloudformation validate-template \
   --region "$AWS_REGION" \
   --template-body file://DeploymentPackage/deploy-01.json
 
-jq empty \
-  DeploymentPackage/deploy-01.json \
-  DeploymentPackage/deploy-01.parameters.json \
-  permissions/CustomIAMPolicy/iam-custom-policy.json \
-  permissions/CustomIAMPolicy/aws-scp.json
-
-bash -n DeploymentPackage/Scripts/userdata-01.sh
-bash -n "Validations/Backup Chain and Whole-CDB PITR.sh"
-bash -n Validations/02-task-freepdb1-datafile-recovery.sh
-bash -n "Validations/FREEPDB1 Plan and RMAN Schedule.sh"
-
-shellcheck DeploymentPackage/Scripts/userdata-01.sh
-shellcheck "Validations/Backup Chain and Whole-CDB PITR.sh" \
-  Validations/02-task-freepdb1-datafile-recovery.sh \
-  "Validations/FREEPDB1 Plan and RMAN Schedule.sh"
+jq empty DeploymentPackage/deploy-01.json DeploymentPackage/deploy-01.parameters.json
+bash -n DeploymentPackage/Scripts/userdata.sh
+shellcheck DeploymentPackage/Scripts/userdata.sh
 ```
 
-Verify the mapped OL9 image is present, available, x86-64, HVM, and Oracle-owned:
+Before publication, resolve and deployment-test the current AL2023 AMI in every supported Region. Also pull the pinned Oracle tag on x86-64 and verify its repository digest. A missing tag, failed pull, architecture mismatch, or digest mismatch is a release blocker.
 
-```bash
-aws ec2 describe-images \
-  --region us-east-1 \
-  --owners 131827586825 \
-  --image-ids ami-0dd239e274077553a \
-  --query 'Images[0].{ImageId:ImageId,State:State,OwnerId:OwnerId,Architecture:Architecture,VirtualizationType:VirtualizationType,Name:Name}' \
-  --output table
-```
+## AWS fact verification
 
-An empty result, API error, non-`available` state, wrong owner, or incompatible architecture is a release blocker.
+The AWS contract was checked against AWS documentation for the relevant platform behavior:
 
-## Post-deployment validation commands
+- Amazon Linux 2023 AMI discovery through public SSM parameters: <https://docs.aws.amazon.com/linux/al2023/ug/launching-using-ssm-parameter.html>
+- CloudFormation dynamic references: <https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references.html>
+- `CreationPolicy` resource signals and timeout behavior: <https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-attribute-creationpolicy.html>
+- `cfn-signal` failure/success signaling: <https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/cfn-signal.html>
+- IAM role trust principals and `sts:AssumeRole`: <https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_terms-and-concepts.html>
+- `AmazonECSTaskExecutionRolePolicy`: <https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AmazonECSTaskExecutionRolePolicy.html>
+- `AmazonSSMManagedInstanceCore`: <https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AmazonSSMManagedInstanceCore.html>
+- CloudFormation `NoEcho` caveats: <https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/parameters-section-structure.html>
+- EBS encryption and gp3 volumes: <https://docs.aws.amazon.com/ebs/latest/userguide/ebs-encryption.html> and <https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html>
+- NVMe EBS volume identification: <https://docs.aws.amazon.com/ebs/latest/userguide/identify-nvme-ebs-device.html>
+- IAM evaluation and explicit-deny precedence: <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html>
 
-Set the actual CloudFormation stack name after deployment:
-
-```bash
-export AWS_REGION=us-east-1
-export STACK_NAME=oracle-backup-recovery-lab
-
-aws cloudformation describe-stacks \
-  --region "$AWS_REGION" \
-  --stack-name "$STACK_NAME" \
-  --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}'
-
-INSTANCE_ID=$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" \
-  --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \
-  --output text)
-
-BACKUP_VOLUME_ID=$(aws cloudformation describe-stacks \
-  --region "$AWS_REGION" \
-  --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='BackupVolumeId'].OutputValue" \
-  --output text)
-
-aws ec2 describe-instances \
-  --region "$AWS_REGION" \
-  --instance-ids "$INSTANCE_ID" \
-  --query 'Reservations[0].Instances[0].{State:State.Name,Type:InstanceType,ImageId:ImageId,IamProfile:IamInstanceProfile.Arn,Metadata:MetadataOptions}' \
-  --output table
-
-aws ec2 describe-volumes \
-  --region "$AWS_REGION" \
-  --volume-ids "$BACKUP_VOLUME_ID" \
-  --query 'Volumes[0].{Type:VolumeType,SizeGiB:Size,Encrypted:Encrypted,State:State,Attachment:Attachments[0].State,InstanceId:Attachments[0].InstanceId}' \
-  --output table
-
-aws ssm describe-instance-information \
-  --region "$AWS_REGION" \
-  --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-  --query 'InstanceInformationList[0].{PingStatus:PingStatus,Platform:PlatformName,PlatformVersion:PlatformVersion,AgentVersion:AgentVersion}' \
-  --output table
-```
-
-Run non-secret guest readiness checks through SSM:
-
-```bash
-COMMAND_ID=$(aws ssm send-command \
-  --region "$AWS_REGION" \
-  --instance-ids "$INSTANCE_ID" \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["set -e","test -f /opt/lab/.ready","systemctl is-active amazon-ssm-agent","systemctl is-active oracle-free-23ai","mountpoint /u02/backup","findmnt /u02/backup"]' \
-  --query 'Command.CommandId' \
-  --output text)
-
-aws ssm wait command-executed \
-  --region "$AWS_REGION" \
-  --command-id "$COMMAND_ID" \
-  --instance-id "$INSTANCE_ID"
-
-aws ssm get-command-invocation \
-  --region "$AWS_REGION" \
-  --command-id "$COMMAND_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --query '{Status:Status,Code:ResponseCode,Output:StandardOutputContent,Error:StandardErrorContent}'
-```
-
-Do not place `VMPassword` in command lines, logs, CI output, SSM parameters, or validation transcripts.
-
-## Scope
-
-Seeded application data is under 2 GiB and resides in `FREEPDB1`, including the dedicated `LABRECOVERY` tablespace/datafile. Learner-run fault scripts are root-owned and require `sudo`; deployment does not execute them. Backups remain on the separate EBS volume, so cross-AZ, cross-Region, and account-level resilience are outside scope.
+AWS-managed image contents, public parameter values, and third-party registry mappings can change. Runtime checks and release deployment tests remain authoritative.

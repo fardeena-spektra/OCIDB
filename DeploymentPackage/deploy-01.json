@@ -1,39 +1,52 @@
 {
   "AWSTemplateFormatVersion": "2010-09-09",
-  "Description": "CloudLabs Stage 1 - Oracle Backup, Recovery & Diagnostics on Oracle Linux 9. WARNING: AdminCidr 0.0.0.0/0, password SSH, and password output are intentionally insecure disposable-lab settings. The mapped Oracle-owned OL9.3 AMI was the last independently verifiable us-east-1 x86_64 image; current availability must be revalidated before publication.",
+  "Description": "CloudLabs Stage 1 - Oracle Backup, Recovery & Diagnostics on Amazon Linux 2023. WARNING: open password SSH, unrestricted clgSg, and password outputs are intentionally insecure disposable-lab conventions.",
   "Metadata": {
     "AWS::CloudFormation::Interface": {
       "ParameterGroups": [
-        { "Label": { "default": "Disposable lab access" }, "Parameters": [ "AdminCidr", "VMUserName", "VMPassword" ] },
-        { "Label": { "default": "Compute and bootstrap" }, "Parameters": [ "InstanceType", "BootstrapScriptUrl" ] }
+        {
+          "Label": { "default": "CloudLabs deployment" },
+          "Parameters": [ "CloudLabsDeploymentID", "CheckAcknowledgement" ]
+        },
+        {
+          "Label": { "default": "Disposable lab access" },
+          "Parameters": [ "AdminCidr", "VMUserName", "VMPassword" ]
+        },
+        {
+          "Label": { "default": "Compute and bootstrap" },
+          "Parameters": [ "InstanceType", "BootstrapScriptUrl", "AmazonECSTaskExecutionRolePolicy" ]
+        }
       ],
       "ParameterLabels": {
         "AdminCidr": { "default": "SSH source CIDR (narrow before launch)" },
         "VMPassword": { "default": "Disposable lab SSH password (also exposed as a stack output)" },
-        "BootstrapScriptUrl": { "default": "Published Bash bootstrap URL (userdata-01.sh)" }
+        "BootstrapScriptUrl": { "default": "Canonical userdata.sh URL" }
       }
     },
-    "OracleLinuxAmiVerification": {
-      "OwnerId": "131827586825",
-      "ImageName": "OL9.3-x86_64-HVM-2024-02-02",
-      "ImageId": "ami-0dd239e274077553a",
-      "Region": "us-east-1",
-      "Status": "UNRESOLVED_CURRENT_AVAILABILITY",
-      "Note": "Oracle-owned AMIs were reported unavailable during 2026. Re-run ec2:DescribeImages against owner 131827586825 and deployment-test before release; do not silently substitute a third-party image."
-    },
-    "OracleDatabaseRpmVerification": {
-      "Status": "VERSION_PIN_REQUIRES_RELEASE_REVALIDATION",
-      "Note": "The bootstrap must use an Oracle-published OL9 Database Free RPM and preinstall package. Official 23ai OL9 steps were verified, but current Oracle documentation has advanced to 26ai; refresh and deployment-test before publication."
-    },
     "BootstrapContract": {
-      "Artifact": "DeploymentPackage/Scripts/userdata-01.sh",
-      "SignalOwner": "external-bootstrap-only",
-      "RequiredEnvironment": "ADMIN_USERNAME,ADMIN_PASSWORD,AWS_REGION,CFN_STACK,CFN_RESOURCE,BACKUP_VOLUME_ID",
-      "CredentialFallbacks": "forbidden; CloudFormation supplies both required credential values",
-      "PublishingNote": "Publish userdata-01.sh at BootstrapScriptUrl before stack creation. The packaged default is a Bash publication path, not a PowerShell artifact."
+      "OperatingSystem": "Amazon Linux 2023 x86_64",
+      "SignalOwner": "standalone-userdata.sh-after-successful-download",
+      "RequiredEnvironment": "CLOUDLABS_DEPLOYMENT_ID,DEPLOYMENT_ID,CFN_STACK,CFN_RESOURCE,ADMIN_USERNAME,ADMIN_PASSWORD,AWS_REGION,BACKUP_VOLUME_ID",
+      "FailureBehavior": "The wrapper signals LabVm failure when download or pre-execution validation fails. After execution begins, userdata.sh owns failure trapping, readiness, and the single success signal.",
+      "SecurityNote": "No shell tracing is enabled and secret values are not printed. CloudFormation Outputs are not secret storage."
     }
   },
   "Parameters": {
+    "CloudLabsDeploymentID": {
+      "Type": "String",
+      "Description": "CloudLabs deployment identifier used in resource Name tags."
+    },
+    "CheckAcknowledgement": {
+      "Type": "String",
+      "Default": "TRUE",
+      "AllowedValues": [ "TRUE", "FALSE" ],
+      "Description": "PAYNOTIFY-compatible acknowledgement parameter."
+    },
+    "AmazonECSTaskExecutionRolePolicy": {
+      "Type": "String",
+      "Default": "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
+      "Description": "Managed policy ARN attached to the ECS task execution role."
+    },
     "AdminCidr": {
       "Type": "String",
       "Default": "0.0.0.0/0",
@@ -65,15 +78,10 @@
     },
     "BootstrapScriptUrl": {
       "Type": "String",
-      "Default": "https://experienceazure.blob.core.windows.net/templates/cloudlabs-common/oracle-backup-recovery-diagnostics/userdata-01.sh",
-      "AllowedPattern": "^https://.+\\.sh(?:[?].*)?$",
-      "ConstraintDescription": "Provide an HTTPS URL whose path names a .sh Bash artifact.",
-      "Description": "Published HTTPS URL for DeploymentPackage/Scripts/userdata-01.sh. The script owns the single success/failure cfn-signal path."
-    }
-  },
-  "Mappings": {
-    "RegionMap": {
-      "us-east-1": { "OracleLinux9Ami": "ami-0dd239e274077553a" }
+      "Default": "https://raw.githubusercontent.com/fardeena-spektra/OCIDB/refs/heads/main/Userdata/userdata.sh",
+      "AllowedPattern": "^https://.+/userdata[.]sh(?:[?].*)?$",
+      "ConstraintDescription": "Provide an HTTPS URL for the canonical userdata.sh Bash artifact.",
+      "Description": "Canonical standalone Amazon Linux 2023 bootstrap. The script owns normal failure trapping, readiness, and final success signaling."
     }
   },
   "Resources": {
@@ -85,42 +93,44 @@
         "EnableDnsSupport": true,
         "InstanceTenancy": "default",
         "Tags": [
-          { "Key": "Name", "Value": { "Fn::Sub": "${AWS::StackName}-vpc" } },
+          { "Key": "Name", "Value": { "Fn::Sub": "${CloudLabsDeploymentID}-vpc" } },
           { "Key": "CloudLabsLab", "Value": "OracleRecoveryDiagnostics" }
         ]
       }
     },
     "InternetGateway": {
       "Type": "AWS::EC2::InternetGateway",
-      "Properties": { "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${AWS::StackName}-igw" } } ] }
+      "Properties": {
+        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${CloudLabsDeploymentID}-igw" } } ]
+      }
     },
     "VpcGatewayAttachment": {
       "Type": "AWS::EC2::VPCGatewayAttachment",
-      "DependsOn": [ "LabVpc", "InternetGateway" ],
-      "Properties": { "InternetGatewayId": { "Ref": "InternetGateway" }, "VpcId": { "Ref": "LabVpc" } }
+      "Properties": {
+        "InternetGatewayId": { "Ref": "InternetGateway" },
+        "VpcId": { "Ref": "LabVpc" }
+      }
     },
     "PublicSubnet": {
       "Type": "AWS::EC2::Subnet",
-      "DependsOn": "LabVpc",
       "Properties": {
         "AvailabilityZone": { "Fn::Select": [ 0, { "Fn::GetAZs": "" } ] },
         "CidrBlock": "10.42.1.0/24",
         "MapPublicIpOnLaunch": true,
         "VpcId": { "Ref": "LabVpc" },
-        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${AWS::StackName}-public-subnet" } } ]
+        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${CloudLabsDeploymentID}-public-subnet" } } ]
       }
     },
     "PublicRouteTable": {
       "Type": "AWS::EC2::RouteTable",
-      "DependsOn": "LabVpc",
       "Properties": {
         "VpcId": { "Ref": "LabVpc" },
-        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${AWS::StackName}-public-rt" } } ]
+        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${CloudLabsDeploymentID}-public-route-table" } } ]
       }
     },
     "DefaultPublicRoute": {
       "Type": "AWS::EC2::Route",
-      "DependsOn": [ "VpcGatewayAttachment", "PublicRouteTable" ],
+      "DependsOn": "VpcGatewayAttachment",
       "Properties": {
         "DestinationCidrBlock": "0.0.0.0/0",
         "GatewayId": { "Ref": "InternetGateway" },
@@ -129,18 +139,49 @@
     },
     "PublicSubnetRouteTableAssociation": {
       "Type": "AWS::EC2::SubnetRouteTableAssociation",
-      "DependsOn": [ "PublicSubnet", "PublicRouteTable", "DefaultPublicRoute" ],
-      "Properties": { "RouteTableId": { "Ref": "PublicRouteTable" }, "SubnetId": { "Ref": "PublicSubnet" } }
+      "Properties": {
+        "RouteTableId": { "Ref": "PublicRouteTable" },
+        "SubnetId": { "Ref": "PublicSubnet" }
+      }
     },
     "LabSecurityGroup": {
       "Type": "AWS::EC2::SecurityGroup",
-      "DependsOn": "LabVpc",
       "Properties": {
         "GroupDescription": "Password SSH for disposable Oracle lab; narrow AdminCidr before launch",
-        "SecurityGroupEgress": [ { "IpProtocol": "-1", "CidrIp": "0.0.0.0/0", "Description": "Bootstrap and AWS service access" } ],
-        "SecurityGroupIngress": [ { "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": { "Ref": "AdminCidr" }, "Description": "Intentionally password-enabled lab SSH" } ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Internet egress for package, registry, and AWS endpoints"
+          }
+        ],
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 22,
+            "ToPort": 22,
+            "CidrIp": { "Ref": "AdminCidr" },
+            "Description": "Intentionally password-enabled disposable-lab SSH"
+          }
+        ],
         "VpcId": { "Ref": "LabVpc" },
-        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${AWS::StackName}-sg" } } ]
+        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${CloudLabsDeploymentID}-vm-sg" } } ]
+      }
+    },
+    "clgSg": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "PAYNOTIFY lab-only unrestricted IPv4 and IPv6 security group",
+        "VpcId": { "Ref": "LabVpc" },
+        "SecurityGroupIngress": [
+          { "IpProtocol": "-1", "CidrIp": "0.0.0.0/0", "Description": "Lab-only unrestricted IPv4 ingress" },
+          { "IpProtocol": "-1", "CidrIpv6": "::/0", "Description": "Lab-only unrestricted IPv6 ingress" }
+        ],
+        "SecurityGroupEgress": [
+          { "IpProtocol": "-1", "CidrIp": "0.0.0.0/0", "Description": "Lab-only unrestricted IPv4 egress" },
+          { "IpProtocol": "-1", "CidrIpv6": "::/0", "Description": "Lab-only unrestricted IPv6 egress" }
+        ],
+        "Tags": [ { "Key": "Name", "Value": { "Fn::Sub": "${CloudLabsDeploymentID}-cluster-sg" } } ]
       }
     },
     "LabInstanceRole": {
@@ -148,22 +189,50 @@
       "Properties": {
         "AssumeRolePolicyDocument": {
           "Version": "2012-10-17",
-          "Statement": [ { "Effect": "Allow", "Principal": { "Service": [ "ec2.amazonaws.com" ] }, "Action": [ "sts:AssumeRole" ] } ]
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": [ "ec2.amazonaws.com" ] },
+              "Action": [ "sts:AssumeRole" ]
+            }
+          ]
         },
         "Description": "Instance role limited to Systems Manager core management; backups remain on EBS.",
         "ManagedPolicyArns": [ "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" ],
         "Path": "/cloudlabs/oracle-recovery/",
-        "Tags": [ { "Key": "CloudLabsProtected", "Value": "true" }, { "Key": "CloudLabsLab", "Value": "OracleRecoveryDiagnostics" } ]
+        "Tags": [
+          { "Key": "CloudLabsProtected", "Value": "true" },
+          { "Key": "CloudLabsLab", "Value": "OracleRecoveryDiagnostics" }
+        ]
       }
     },
     "LabInstanceProfile": {
       "Type": "AWS::IAM::InstanceProfile",
-      "DependsOn": "LabInstanceRole",
-      "Properties": { "Path": "/cloudlabs/oracle-recovery/", "Roles": [ { "Ref": "LabInstanceRole" } ] }
+      "Properties": {
+        "Path": "/cloudlabs/oracle-recovery/",
+        "Roles": [ { "Ref": "LabInstanceRole" } ]
+      }
+    },
+    "TaskExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ] },
+              "Action": [ "sts:AssumeRole" ]
+            }
+          ]
+        },
+        "Description": "PAYNOTIFY-compatible ECS task execution role.",
+        "ManagedPolicyArns": [ { "Ref": "AmazonECSTaskExecutionRolePolicy" } ],
+        "Tags": [ { "Key": "CloudLabsDeploymentID", "Value": { "Ref": "CloudLabsDeploymentID" } } ]
+      }
     },
     "BackupVolume": {
       "Type": "AWS::EC2::Volume",
-      "DependsOn": "PublicSubnet",
       "DeletionPolicy": "Delete",
       "UpdateReplacePolicy": "Delete",
       "Properties": {
@@ -174,7 +243,7 @@
         "Throughput": 125,
         "VolumeType": "gp3",
         "Tags": [
-          { "Key": "Name", "Value": { "Fn::Sub": "${AWS::StackName}-oracle-backup" } },
+          { "Key": "Name", "Value": { "Fn::Sub": "${CloudLabsDeploymentID}-oracle-backup" } },
           { "Key": "MountPoint", "Value": "/u02/backup" },
           { "Key": "CloudLabsLab", "Value": "OracleRecoveryDiagnostics" }
         ]
@@ -182,17 +251,33 @@
     },
     "LabVm": {
       "Type": "AWS::EC2::Instance",
-      "DependsOn": [ "DefaultPublicRoute", "PublicSubnetRouteTableAssociation", "LabSecurityGroup", "LabInstanceProfile", "BackupVolume" ],
-      "CreationPolicy": { "ResourceSignal": { "Count": 1, "Timeout": "PT90M" } },
+      "DependsOn": [
+        "DefaultPublicRoute",
+        "PublicSubnetRouteTableAssociation",
+        "LabInstanceProfile",
+        "BackupVolume"
+      ],
+      "CreationPolicy": {
+        "ResourceSignal": {
+          "Count": 1,
+          "Timeout": "PT60M"
+        }
+      },
       "Properties": {
         "BlockDeviceMappings": [
           {
-            "DeviceName": "/dev/sda1",
-            "Ebs": { "DeleteOnTermination": true, "Encrypted": true, "Iops": 3000, "VolumeSize": 50, "VolumeType": "gp3" }
+            "DeviceName": "/dev/xvda",
+            "Ebs": {
+              "DeleteOnTermination": true,
+              "Encrypted": true,
+              "Iops": 3000,
+              "VolumeSize": 50,
+              "VolumeType": "gp3"
+            }
           }
         ],
         "IamInstanceProfile": { "Ref": "LabInstanceProfile" },
-        "ImageId": { "Fn::FindInMap": [ "RegionMap", { "Ref": "AWS::Region" }, "OracleLinux9Ami" ] },
+        "ImageId": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}",
         "InstanceType": { "Ref": "InstanceType" },
         "MetadataOptions": {
           "HttpEndpoint": "enabled",
@@ -203,32 +288,92 @@
         "SecurityGroupIds": [ { "Fn::GetAtt": [ "LabSecurityGroup", "GroupId" ] } ],
         "SubnetId": { "Ref": "PublicSubnet" },
         "Tags": [
-          { "Key": "Name", "Value": { "Fn::Sub": "${AWS::StackName}-oracle-lab-vm" } },
+          { "Key": "Name", "Value": "labvm" },
+          { "Key": "CloudLabsDeploymentID", "Value": { "Ref": "CloudLabsDeploymentID" } },
           { "Key": "CloudLabsLab", "Value": "OracleRecoveryDiagnostics" },
           { "Key": "CloudLabsManaged", "Value": "true" }
         ],
-        "Volumes": [ { "Device": "/dev/sdf", "VolumeId": { "Ref": "BackupVolume" } } ],
+        "Volumes": [
+          {
+            "Device": "/dev/sdf",
+            "VolumeId": { "Ref": "BackupVolume" }
+          }
+        ],
         "UserData": {
           "Fn::Base64": {
-            "Fn::Sub": "#!/bin/bash\nset -Eeuo pipefail\numask 077\nexec > /var/log/cloudlabs-userdata-wrapper.log 2>&1\n\n# The external Bash artifact is the sole owner of both success and failure cfn-signal calls.\n# Do not add a wrapper trap or a second cfn-signal invocation here.\nexport ADMIN_USERNAME='${VMUserName}'\nexport ADMIN_PASSWORD='${VMPassword}'\nexport AWS_REGION='${AWS::Region}'\nexport CFN_STACK='${AWS::StackName}'\nexport CFN_RESOURCE='LabVm'\nexport BACKUP_VOLUME_ID='${BackupVolume}'\n\n# Supply every required credential value explicitly; the bootstrap contract forbids fallback credentials.\ntest -n \"$ADMIN_USERNAME\"\ntest -n \"$ADMIN_PASSWORD\"\ntest -n \"$AWS_REGION\"\ntest -n \"$CFN_STACK\"\ntest -n \"$CFN_RESOURCE\"\ntest -n \"$BACKUP_VOLUME_ID\"\n\ninstall -d -m 0755 /opt/lab\nBOOTSTRAP=/opt/lab/stage1-bootstrap.sh\ncurl --fail --silent --show-error --location '${BootstrapScriptUrl}' --output \"$BOOTSTRAP\"\nhead -n 1 \"$BOOTSTRAP\" | grep -Eq '^#!.*/(env +)?bash([[:space:]]|$)'\nchmod 0700 \"$BOOTSTRAP\"\nexec \"$BOOTSTRAP\"\n"
+            "Fn::Sub": "#!/bin/bash\nset -Eeuo pipefail\numask 077\nexec >>/var/log/cloudlabs-userdata-wrapper.log 2>&1\n\n# Export required inputs without xtrace or printing secret values.\nexport CLOUDLABS_DEPLOYMENT_ID='${CloudLabsDeploymentID}'\nexport DEPLOYMENT_ID='${CloudLabsDeploymentID}'\nexport CFN_STACK='${AWS::StackName}'\nexport CFN_RESOURCE='LabVm'\nexport ADMIN_USERNAME='${VMUserName}'\nexport ADMIN_PASSWORD='${VMPassword}'\nexport AWS_REGION='${AWS::Region}'\nexport BACKUP_VOLUME_ID='${BackupVolume}'\n\ninstall -d -m 0700 /opt/lab\nBOOTSTRAP=/opt/lab/userdata.sh\n\n# The wrapper owns only download/pre-execution failure signaling.\nif ! curl --fail --silent --show-error --location --retry 3 '${BootstrapScriptUrl}' --output \"$BOOTSTRAP\"; then\n  /opt/aws/bin/cfn-signal --success false --reason 'Failed to download userdata.sh' --stack \"$CFN_STACK\" --resource LabVm --region \"$AWS_REGION\" || true\n  exit 1\nfi\n\n# Canonical artifact must use Unix LF and have #!/bin/bash as byte/line one.\nsed -i 's/\\r$//' \"$BOOTSTRAP\"\nif [ \"$(head -n 1 \"$BOOTSTRAP\")\" != '#!/bin/bash' ]; then\n  /opt/aws/bin/cfn-signal --success false --reason 'userdata.sh failed shebang validation' --stack \"$CFN_STACK\" --resource LabVm --region \"$AWS_REGION\" || true\n  exit 1\nfi\nchmod 0700 \"$BOOTSTRAP\"\n\ntest -n \"$CLOUDLABS_DEPLOYMENT_ID\"\ntest -n \"$CFN_STACK\"\ntest -n \"$ADMIN_USERNAME\"\ntest -n \"$ADMIN_PASSWORD\"\ntest -n \"$AWS_REGION\"\ntest -n \"$BACKUP_VOLUME_ID\"\n\n# Do not signal success here. userdata.sh owns normal failure trapping, readiness, and final signaling.\nexec \"$BOOTSTRAP\"\n"
           }
         }
       }
     }
   },
   "Outputs": {
-    "InstanceId": { "Description": "EC2 instance ID and SSM target", "Value": { "Ref": "LabVm" } },
-    "PublicIPv4": { "Description": "Learner VM public IPv4 address", "Value": { "Fn::GetAtt": [ "LabVm", "PublicIp" ] } },
-    "PublicDnsName": { "Description": "Learner VM public DNS name", "Value": { "Fn::GetAtt": [ "LabVm", "PublicDnsName" ] } },
-    "SSHCommandHint": { "Description": "Password SSH command hint", "Value": { "Fn::Sub": "ssh ${VMUserName}@${LabVm.PublicDnsName}" } },
-    "SSMTarget": { "Description": "Use with aws ssm start-session --target", "Value": { "Ref": "LabVm" } },
-    "OracleServices": { "Description": "CDB service and learner PDB service", "Value": "FREE,FREEPDB1" },
-    "BackupMount": { "Description": "Dedicated RMAN backup filesystem", "Value": "/u02/backup" },
-    "BackupVolumeId": { "Description": "Encrypted 30 GiB gp3 backup volume", "Value": { "Ref": "BackupVolume" } },
-    "VMUserName": { "Description": "Password SSH user", "Value": { "Ref": "VMUserName" } },
-    "VMPassword": { "Description": "DISPOSABLE LAB ONLY: CloudFormation outputs are not a secret store", "Value": { "Ref": "VMPassword" } },
-    "vmServerDnsName": { "Value": { "Fn::GetAtt": [ "LabVm", "PublicDnsName" ] } },
-    "vmServerUsername": { "Value": { "Ref": "VMUserName" } },
-    "vmServerPassword": { "Value": { "Ref": "VMPassword" } }
+    "CloudLabsDeploymentID": {
+      "Value": { "Ref": "CloudLabsDeploymentID" }
+    },
+    "AWSAccountID": {
+      "Value": { "Ref": "AWS::AccountId" }
+    },
+    "Region": {
+      "Value": { "Ref": "AWS::Region" }
+    },
+    "VpcId": {
+      "Value": { "Ref": "LabVpc" }
+    },
+    "vmSubnetId": {
+      "Value": { "Ref": "PublicSubnet" }
+    },
+    "vmSecurityGroupId": {
+      "Value": { "Fn::GetAtt": [ "LabSecurityGroup", "GroupId" ] }
+    },
+    "clusterSecurityGroupId": {
+      "Value": { "Fn::GetAtt": [ "clgSg", "GroupId" ] }
+    },
+    "TaskExecutionRole": {
+      "Value": { "Fn::GetAtt": [ "TaskExecutionRole", "Arn" ] }
+    },
+    "InstanceId": {
+      "Value": { "Ref": "LabVm" }
+    },
+    "VMName": {
+      "Value": "labvm"
+    },
+    "VMPublicIP": {
+      "Value": { "Fn::GetAtt": [ "LabVm", "PublicIp" ] }
+    },
+    "VMPrivateIP": {
+      "Value": { "Fn::GetAtt": [ "LabVm", "PrivateIp" ] }
+    },
+    "VMPublicDNSName": {
+      "Value": { "Fn::GetAtt": [ "LabVm", "PublicDnsName" ] }
+    },
+    "VMPrivateDNSName": {
+      "Value": { "Fn::GetAtt": [ "LabVm", "PrivateDnsName" ] }
+    },
+    "VMUserName": {
+      "Value": { "Ref": "VMUserName" }
+    },
+    "VMPassword": {
+      "Description": "DISPOSABLE LAB ONLY: CloudFormation outputs are not secret storage",
+      "Value": { "Ref": "VMPassword" }
+    },
+    "BackupVolumeId": {
+      "Value": { "Ref": "BackupVolume" }
+    },
+    "BackupMount": {
+      "Value": "/u02/backup"
+    },
+    "OracleContainerName": {
+      "Value": "oracle-free"
+    },
+    "OracleServices": {
+      "Value": "FREE,FREEPDB1"
+    },
+    "OracleListenerPort": {
+      "Value": "1521"
+    },
+    "SSMTarget": {
+      "Value": { "Ref": "LabVm" }
+    }
   }
 }

@@ -3,7 +3,7 @@
   "slug": "oracle-backup-recovery-and-diagnostics-jUQnc",
   "title": "Oracle Backup, Recovery & Diagnostics",
   "version": 1,
-  "exportedAt": "2026-10-01T13:35:52.468Z",
+  "exportedAt": "2026-10-01T15:04:47.514Z",
   "force": false,
   "deliverableConfig": {
     "arm": {
@@ -56,6 +56,11 @@
       "path": "DeploymentPackage/Scripts/userdata-01.sh",
       "kind": "bash_script",
       "lintStatus": "warn"
+    },
+    {
+      "path": "DeploymentPackage/Scripts/userdata.sh",
+      "kind": "bash_script",
+      "lintStatus": "passed"
     },
     {
       "path": "Inline-Questions/question-01.md",

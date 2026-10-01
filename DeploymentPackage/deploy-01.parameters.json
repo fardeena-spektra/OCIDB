@@ -1,6 +1,18 @@
 {
   "Parameters": [
     {
+      "ParameterKey": "CloudLabsDeploymentID",
+      "ParameterValue": "GET-DEPLOYMENT-ID"
+    },
+    {
+      "ParameterKey": "CheckAcknowledgement",
+      "ParameterValue": "TRUE"
+    },
+    {
+      "ParameterKey": "AmazonECSTaskExecutionRolePolicy",
+      "ParameterValue": "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+    },
+    {
       "ParameterKey": "AdminCidr",
       "ParameterValue": "0.0.0.0/0"
     },
@@ -18,7 +30,7 @@
     },
     {
       "ParameterKey": "BootstrapScriptUrl",
-      "ParameterValue": "https://experienceazure.blob.core.windows.net/templates/cloudlabs-common/oracle-backup-recovery-diagnostics/userdata-01.sh"
+      "ParameterValue": "https://raw.githubusercontent.com/fardeena-spektra/OCIDB/refs/heads/main/Userdata/userdata.sh"
     }
   ]
 }

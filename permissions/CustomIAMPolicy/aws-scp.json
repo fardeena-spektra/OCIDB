@@ -1,33 +1,49 @@
 {
   "Version": "2012-10-17",
-  "Description": "Identity-based IAM policy containing explicit Deny guardrails for the Oracle Backup, Recovery & Diagnostics lab. This document is NOT an AWS Organizations Service Control Policy (SCP), is not attached to an organization or account, and must be attached to the candidate IAM user, group, or role. The legacy aws-scp.json filename is retained for package compatibility.",
   "Statement": [
     {
-      "Sid": "DenyRequestsOutsideLabRegion",
+      "Sid": "DenyRegionsOutsideSandbox",
       "Effect": "Deny",
       "Action": "*",
       "Resource": "*",
       "Condition": {
         "StringNotEquals": {
-          "aws:RequestedRegion": "us-east-1"
+          "aws:RequestedRegion": [
+            "us-east-1",
+            "us-east-2"
+          ]
+        },
+        "StringNotEqualsIfExists": {
+          "aws:PrincipalServiceName": [
+            "cloudformation.amazonaws.com"
+          ]
         }
       }
     },
     {
-      "Sid": "DenyNonT3Instances",
+      "Sid": "DenyExpensiveSku",
       "Effect": "Deny",
       "Action": "ec2:RunInstances",
-      "Resource": "*",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
       "Condition": {
-        "StringNotLike": {
-          "ec2:InstanceType": "t3.*"
+        "StringNotEquals": {
+          "ec2:InstanceType": [
+            "t3.micro",
+            "t3.small",
+            "t3.medium",
+            "t3.large"
+          ]
         }
       }
     },
     {
-      "Sid": "DenyUnencryptedEbsVolumes",
+      "Sid": "DenyUnencryptedEbs",
       "Effect": "Deny",
-      "Action": "ec2:CreateVolume",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:CreateVolume",
+        "ec2:ModifyVolume"
+      ],
       "Resource": "*",
       "Condition": {
         "Bool": {
@@ -36,72 +52,54 @@
       }
     },
     {
-      "Sid": "DenyUnencryptedEbsAtInstanceLaunch",
-      "Effect": "Deny",
-      "Action": "ec2:RunInstances",
-      "Resource": "*",
-      "Condition": {
-        "Bool": {
-          "ec2:Encrypted": "false"
-        }
-      }
-    },
-    {
-      "Sid": "DenyChangesToProtectedIamRoles",
-      "Effect": "Deny",
-      "Action": [
-        "iam:DeleteRole",
-        "iam:UpdateRole",
-        "iam:UpdateAssumeRolePolicy",
-        "iam:PutRolePolicy",
-        "iam:DeleteRolePolicy",
-        "iam:AttachRolePolicy",
-        "iam:DetachRolePolicy"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringLike": {
-          "iam:RoleName": [
-            "OrganizationAccountAccessRole",
-            "AWSReservedSSO_*",
-            "CloudLabsProtected-*"
-          ]
-        }
-      }
-    },
-    {
-      "Sid": "DenyChangesToProtectedIamPolicies",
-      "Effect": "Deny",
-      "Action": [
-        "iam:DeletePolicy",
-        "iam:CreatePolicyVersion",
-        "iam:DeletePolicyVersion",
-        "iam:SetDefaultPolicyVersion"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringLike": {
-          "iam:PolicyName": [
-            "AdministratorAccess",
-            "AWSOrganizationsFullAccess",
-            "CloudLabsProtected-*"
-          ]
-        }
-      }
-    },
-    {
-      "Sid": "DenyProtectedControlPlaneTampering",
+      "Sid": "DenyProtectedResourceTampering",
       "Effect": "Deny",
       "Action": [
         "cloudformation:DeleteStack",
         "cloudformation:UpdateStack",
-        "cloudformation:UpdateStackSet",
-        "cloudformation:DeleteStackSet"
+        "cloudformation:ContinueUpdateRollback",
+        "iam:DeleteRole",
+        "iam:DeleteInstanceProfile",
+        "ec2:TerminateInstances",
+        "ec2:DeleteVolume",
+        "ec2:DeleteVpc",
+        "ec2:DeleteSubnet",
+        "ec2:DeleteRouteTable",
+        "ec2:DeleteInternetGateway",
+        "ec2:DeleteSecurityGroup"
       ],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
           "aws:ResourceTag/CloudLabsProtected": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyIamPrivilegeEscalation",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateUser",
+        "iam:CreateGroup",
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:AttachUserPolicy",
+        "iam:AttachGroupPolicy",
+        "iam:PutUserPolicy",
+        "iam:PutGroupPolicy",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:PassRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:UpdateRole",
+        "iam:DeletePolicyVersion",
+        "iam:DeleteRolePermissionsBoundary"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/CloudLabsDeploymentRole"
         }
       }
     }

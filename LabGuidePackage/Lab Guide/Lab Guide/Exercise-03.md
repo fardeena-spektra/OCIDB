@@ -1,31 +1,32 @@
-# Exercise 3 — Diagnose SQL regression and automate backup verification
+# Exercise 3 — Diagnose SQL regression and automate RMAN verification
 
 ## Scenario
 
-A reporting query became slower after bulk data changes. You must use the supplied evidence to form a hypothesis, test it against the live `FREEPDB1` workload, make a narrowly scoped optimizer-statistics change, and prove that the result is both faster and correct. You will then operationalize RMAN backup verification.
+A reporting query became slower after bulk data changes. You must form a hypothesis from supplied incident clues, test it against the live `FREEPDB1` workload, make a narrowly scoped optimizer-statistics change, and prove that the result is both faster and correct. You will then implement recurring RMAN verification on the Amazon Linux host while every Oracle command runs inside the long-running database container.
 
 > [!Important]
-> The files named **AWR-style** and **ASH-style** in this exercise are seeded simulations. Oracle Database Free did **not** generate AWR or ASH data. Treat the reports as incident clues, then corroborate them with live execution plans, elapsed-time measurements, row-source statistics, checksums, and dynamic performance views that are available in the lab.
+> The supplied **AWR-style** and **ASH-style** reports are **simulated training reports**. Oracle Database Free did not generate AWR or ASH data. Do not represent these files as Oracle-generated reports. Use them only as clues, and corroborate the hypothesis with live execution plans, repeated runtime measurements, result checksums, and dynamic performance views available in this lab.
 
 ## Objectives
 
 In this exercise, you will:
 
-- Identify the dominant SQL, wait pattern, affected object, and stale or missing statistics indicated by the simulated reports.
-- Reproduce the regression in `FREEPDB1` and preserve a defensible baseline.
-- Gather statistics only for the affected application object or objects.
-- Demonstrate a better access path or stable objective metric without changing the result checksum.
-- Build and schedule a safe RMAN verification program with timestamped logs, overlap protection, and meaningful exit status.
+- Diagnose the regression using simulated clues and live non-AWR evidence.
+- Capture reproducible before-and-after plans and objective metrics from `FREEPDB1`.
+- Gather targeted `DBMS_STATS` statistics for only the affected application objects.
+- Prove that the tuned query returns identical results.
+- Build a Docker-aware RMAN verification script with overlap prevention and truthful failure propagation.
+- Enable a recurring systemd timer or cron schedule and retain an authentic successful run.
 
-## Sign in and connect to the lab instance
+## Sign in and connect
 
-1. Open <inject key="AwsConsoleUrl"></inject> and sign in with:
+1. Open <inject key="AwsConsoleUrl"></inject> and sign in using:
    - **User name:** <inject key="IamUserName"></inject>
    - **Password:** <inject key="IamUserPassword"></inject>
 
-2. Confirm that the console is using AWS account <inject key="AwsAccountId"></inject> and Region <inject key="AwsRegion"></inject>.
+2. Confirm that the console shows AWS account <inject key="AwsAccountId"></inject> and Region <inject key="AwsRegion"></inject>.
 
-3. On the workstation that has your preconfigured AWS CLI profile, assign these displayed lab values to shell variables. Your deployment ID is <inject key="DeploymentID"></inject>, and your Region is <inject key="AwsRegion"></inject>.
+3. On the workstation with your configured AWS CLI profile, set variables from the displayed values. The deployment ID is <inject key="DeploymentID"></inject>, and the Region is <inject key="AwsRegion"></inject>.
 
    ```bash
    export DEPLOYMENT_ID='paste-the-displayed-deployment-id'
@@ -33,7 +34,7 @@ In this exercise, you will:
    aws sts get-caller-identity
    ```
 
-4. Locate the running lab instance by its CloudFormation stack-name tag. Keep the filter narrow so you do not connect to another candidate's instance.
+4. Resolve exactly one running instance from its CloudFormation stack-name tag.
 
    ```bash
    INSTANCE_ID=$(aws ec2 describe-instances \
@@ -48,170 +49,242 @@ In this exercise, you will:
    test -n "$INSTANCE_ID" && test "$(wc -w <<<"$INSTANCE_ID")" -eq 1
    ```
 
-5. Start an AWS Systems Manager Session Manager shell. AWS requires the Session Manager plugin when `start-session` is invoked from the CLI.
+5. Start an AWS Systems Manager Session Manager session. The AWS CLI command is interactive and requires the Session Manager plugin on the local workstation.
 
    ```bash
    aws ssm start-session --region "$AWS_REGION" --target "$INSTANCE_ID"
    ```
 
-6. In the managed-node shell, obtain a root login shell and confirm that bootstrap completed. Do not print credential files or place passwords in evidence.
+6. In the managed-node shell, obtain a root login shell and verify readiness.
 
    ```bash
    sudo -i
    test -f /opt/lab/.ready
-   findmnt /u02/backup
    systemctl is-active amazon-ssm-agent
+   systemctl is-active docker
+   findmnt /u02/backup
    ```
 
 > [!Note]
-> If CLI Session Manager is unavailable, use **AWS Systems Manager → Node Management → Session Manager → Start session**, select the lab managed node, and choose **Start session**. Do not weaken the security group to work around an SSM client problem.
+> If the local Session Manager plugin is unavailable, in the AWS console open **AWS Systems Manager → Node Management → Session Manager**, choose **Start session**, select the lab managed node, and start the session. Do not open additional inbound ports to work around a local client issue.
 
-## Task 1 — Build a diagnosis from the simulated evidence
+## Docker command contract
 
-Create the evidence directory and preserve a session transcript. Do not alter the supplied reports.
+Oracle Database Free runs inside Docker; SQL*Plus and RMAN are not host-installed tools. Dynamically resolve the intended running container before each task or script run:
 
 ```bash
-install -d -o oracle -g oinstall /opt/lab/evidence/ex3
+mapfile -t CONTAINERS < <(docker ps \
+  --filter name=oracle-free \
+  --filter status=running \
+  --format '{{.ID}}')
+
+if (( ${#CONTAINERS[@]} != 1 )); then
+  printf 'Expected exactly one running oracle-free container; found %d\n' \
+    "${#CONTAINERS[@]}" >&2
+  exit 1
+fi
+
+CONTAINER_ID=${CONTAINERS[0]}
+printf 'Oracle container: %s\n' "$CONTAINER_ID"
+docker ps --filter "id=$CONTAINER_ID"
+```
+
+The required discovery expression at the core of your automation is:
+
+```bash
+CONTAINER_ID=$(docker ps --filter name=oracle-free --filter status=running -q | head -n 1)
+```
+
+The `head` expression alone is not sufficient: your script must also count the matches and fail unless exactly one intended container is running. Never hardcode a container ID. Database state operations affect the Oracle instance inside the container; they must not stop or remove the container itself. Do not run `docker stop`, `docker rm`, or `docker compose down`.
+
+## Task 1 — Form a hypothesis from simulated evidence
+
+Create the evidence directory without modifying the seeded diagnostics.
+
+```bash
+install -d -m 0755 /opt/lab/evidence/ex3
 script -q -a /opt/lab/evidence/ex3/diagnosis-session.txt
 ```
 
-Review these seeded files:
+Review these concrete files:
 
-- `/opt/lab/diagnostics/simulated-awr-style.txt`
-- `/opt/lab/diagnostics/simulated-ash-style.txt`
+- `/opt/lab/diagnostics/simulated-awr-style.txt` — **simulated, not Oracle-generated AWR**
+- `/opt/lab/diagnostics/simulated-ash-style.txt` — **simulated, not Oracle-generated ASH**
 - `/opt/lab/workload/reporting-query.sql`
 - `/opt/lab/expected/reporting-query.sha256`
 
-Record your findings in `/opt/lab/evidence/ex3/diagnosis.md`. Your diagnosis must identify:
+Write `/opt/lab/evidence/ex3/diagnosis.md`. Identify:
 
-1. The dominant SQL identifier or statement signature.
-2. The dominant wait class/event pattern and whether it points primarily to I/O, CPU, or locking.
-3. The table or index implicated by the evidence.
-4. The evidence for stale, missing, or unrepresentative optimizer statistics.
-5. A testable prediction for the baseline plan and estimated-versus-actual rows.
+1. The dominant SQL identifier or statement signature in the simulation.
+2. The simulated wait class/event pattern and whether it suggests I/O, CPU, or locking.
+3. The affected table or index.
+4. The clue suggesting stale, missing, or unrepresentative statistics.
+5. A testable prediction about the baseline access path and estimated-versus-actual rows.
+6. The live measurements that could falsify your prediction.
 
-Do not cite the simulated reports as proof of live behavior. Use them only to select what you will measure next.
+Do not treat a simulated wait event as proof of current database behavior.
 
 <question path="Inline-Questions/question-04.md" />
 
-## Task 2 — Reproduce and capture a live baseline in `FREEPDB1`
+## Task 2 — Capture the live `FREEPDB1` baseline through Docker
 
-Work as the Oracle software owner and connect explicitly to `FREEPDB1`. Before running the workload, prove the container context and spool all output.
+Resolve the container again. Start SQL*Plus inside that container rather than on the Amazon Linux host.
 
 ```bash
-sudo -iu oracle
-export ORACLE_SID=FREE
-mkdir -p /opt/lab/evidence/ex3
-sqlplus / as sysdba
+mapfile -t CONTAINERS < <(docker ps --filter name=oracle-free --filter status=running -q)
+(( ${#CONTAINERS[@]} == 1 )) || { echo 'Container discovery failed' >&2; exit 1; }
+CONTAINER_ID=${CONTAINERS[0]}
+docker exec -it "$CONTAINER_ID" sqlplus / as sysdba
 ```
 
-Inside SQL*Plus, set the container to `FREEPDB1`, confirm it with `SYS_CONTEXT('USERENV','CON_NAME')`, and capture the baseline in `/opt/lab/evidence/ex3/baseline.txt`.
+Within SQL*Plus, switch to `FREEPDB1` and verify the active container with `SYS_CONTEXT('USERENV','CON_NAME')`. Use SQL*Plus spooling to create `/opt/lab/evidence/ex3/baseline-plan.txt`. Because `/opt/lab/evidence` is visible in the container, confirm the spool file appears on the host after exiting SQL*Plus.
 
-Your baseline must contain all of the following:
+The baseline evidence must contain:
 
-- The unmodified SQL from `/opt/lab/workload/reporting-query.sql`.
-- At least three timed executions after one warm-up execution; retain every measured value rather than only the best run.
-- The displayed cursor plan with runtime row-source statistics, including predicates, estimated rows, actual rows, buffers, and elapsed time.
-- Relevant optimizer-statistics metadata for the implicated application objects in `FREEPDB1`.
-- A live dynamic-performance-view observation that supports or challenges the simulated wait evidence.
-- The returned row count and deterministic checksum, compared with `/opt/lab/expected/reporting-query.sha256`.
+- The unmodified query from `/opt/lab/workload/reporting-query.sql`.
+- One warm-up execution followed by at least three measured executions, retaining every value.
+- A displayed cursor plan with runtime row-source statistics, predicates, estimated rows, actual rows, buffers, and elapsed time.
+- Relevant table, column, and index statistics metadata for the implicated objects.
+- A live observation from `V$SQL` or an available session/system wait view that supports or challenges the simulated clue.
+- The returned row count and deterministic checksum compared with `/opt/lab/expected/reporting-query.sha256`.
 
-Use non-AWR facilities such as SQL*Plus timing, `DBMS_XPLAN.DISPLAY_CURSOR`, `V$SQL`, and available session/system wait views. Ensure the statement gathers runtime row-source statistics, but do not edit its business predicates or result projection.
+Use non-AWR facilities such as SQL*Plus timing and `DBMS_XPLAN.DISPLAY_CURSOR`. Enable runtime row-source statistics for the measured statement without changing its business predicates or projection.
+
+At the end of `/opt/lab/evidence/ex3/baseline-plan.txt`, include a concise machine-readable summary using these labels:
+
+```text
+container=FREEPDB1
+object=OWNER.TABLE_NAME
+PLAN_HASH_VALUE=<numeric value>
+checksum=<deterministic value>
+buffer_gets=<numeric value>
+elapsed_ms=<numeric value>
+```
+
+Replace the placeholders with measured values. The plan body must also show real operations such as `TABLE ACCESS`, `INDEX ... SCAN`, `HASH JOIN`, or `NESTED LOOPS`.
 
 > [!Caution]
-> Do not flush the shared pool, restart the database, create an index, add a hint, change an initialization parameter, or gather schema-wide/database-wide statistics. Those changes would confound the required comparison.
+> Do not flush the shared pool, restart the database, create an index, add a hint, change an initialization parameter, or gather schema-wide or database-wide statistics. Those changes would invalidate the comparison.
 
 ## Task 3 — Gather targeted statistics and prove improvement
 
-Based on your baseline, use `DBMS_STATS` in `FREEPDB1` to gather only the statistics needed for the affected application object or objects. Select options that address the cardinality problem you observed; do not gather all schemas or the whole database.
+From SQL*Plus inside the dynamically discovered container, use `DBMS_STATS` in `FREEPDB1` to gather only the statistics required for the affected application object or objects. Select options that address the observed cardinality problem. Do not gather all schemas or the whole database.
 
-Save the exact PL/SQL call and before/after statistics metadata in:
+Retain:
 
-- `/opt/lab/evidence/ex3/stats-change.sql`
-- `/opt/lab/evidence/ex3/stats-before-after.txt`
+- `/opt/lab/evidence/ex3/stats-change.sql` — the exact targeted PL/SQL call.
+- `/opt/lab/evidence/ex3/stats-before-after.txt` — before/after `LAST_ANALYZED` and relevant table, column, histogram, or index metadata.
+- `/opt/lab/evidence/ex3/after-plan.txt` — the repeated post-change workload and live plan.
+- `/opt/lab/evidence/ex3/tuning-summary.md` — your interpretation and comparison.
 
-Re-run the same workload under the same measurement procedure and spool `/opt/lab/evidence/ex3/after-stats.txt`. Your comparison must show:
+Use the same query text, inputs, warm-up procedure, and number of measured executions. The post-change evidence must prove:
 
-- The container is still `FREEPDB1`.
-- The SQL text and bind/literal inputs are unchanged.
-- The checksum exactly matches the baseline and expected checksum.
-- Statistics timestamps and relevant column/index/table metadata reflect the targeted operation.
-- Estimated and actual cardinalities are better aligned at the problematic operation.
-- The access path improves in the way predicted by your diagnosis.
-- The median of at least three measured post-change executions improves, or another stable plan metric such as buffer gets improves materially.
+- The current Oracle container is `FREEPDB1`.
+- The checksum is identical to both the baseline and expected checksum.
+- The targeted object's statistics are fresh.
+- Estimated and actual cardinalities align more closely at the problematic operation.
+- The access path changes as predicted.
+- The median of at least three post-change runs improves, or a more stable metric such as buffer gets improves materially.
 
-Summarize the comparison in `/opt/lab/evidence/ex3/tuning-summary.md`. Include the before/after plan hash values, access paths, estimated-versus-actual row counts, buffer gets, all measured runtimes, medians, and checksums. CPU-credit and cache variation on a `t3.large` can affect wall-clock time, so do not rely on a single fast execution.
+End `/opt/lab/evidence/ex3/after-plan.txt` with the same machine-readable labels used in the baseline. Use the same `object=OWNER.TABLE_NAME` and checksum values, but record the new numeric plan hash and measured metrics. The validator expects a genuine changed plan and at least a 20 percent improvement in `buffer_gets` or `elapsed_ms`; do not fabricate evidence.
+
+In `/opt/lab/evidence/ex3/tuning-summary.md`, list all measured runtimes, both medians, both plan hashes, access paths, estimated and actual row counts, buffer gets, checksums, and the targeted statistics operation. A `t3.large` can show cache and CPU-credit variation, so a single fast execution is not sufficient.
 
 <question path="Inline-Questions/question-05.md" />
 
-## Task 4 — Implement safe RMAN verification
+## Task 4 — Build a Docker-aware RMAN verifier
 
-Return to a root shell and create the executable program `/usr/local/sbin/rman-verify.sh`. It must perform real checks rather than print a predetermined success message.
+Return to the host root shell. Create the executable host program `/usr/local/sbin/rman-verify.sh`. The host script must invoke RMAN with `docker exec`; it must not look for host copies of `rman`, `sqlplus`, `ORACLE_HOME`, or `/etc/oratab`.
 
-Your program must:
-
-1. Enable strict Bash error handling and propagate a nonzero exit code when any required RMAN operation or post-check fails.
-2. Prevent overlapping runs with an advisory lock, and treat inability to acquire that lock as a failure.
-3. Create a new UTC timestamped log below `/u02/backup/verification/` for each run.
-4. Run RMAN `CROSSCHECK` for the backup and archived-log records used by this lab.
-5. Report expired or missing artifacts after crosscheck and fail if unacceptable artifacts remain.
-6. Run restore validation without writing restored database files or overwriting backup pieces.
-7. Capture both standard output and standard error in the run log.
-8. Record start time, end time, host, database, and final exit status without exposing credentials.
-
-Keep the Oracle environment explicit because systemd and cron do not inherit your interactive shell. Before scheduling, inspect the configured Oracle home and RMAN path rather than assuming them.
+Before implementation, verify the boundary:
 
 ```bash
 sudo -i
-readlink -f "$(command -v rman || true)"
-grep -v '^[[:space:]]*#' /etc/oratab
 findmnt /u02/backup
-install -d -m 0750 -o oracle -g oinstall /u02/backup/verification
+systemctl is-active docker
+mapfile -t CONTAINERS < <(docker ps --filter name=oracle-free --filter status=running -q)
+(( ${#CONTAINERS[@]} == 1 ))
+CONTAINER_ID=${CONTAINERS[0]}
+docker exec "$CONTAINER_ID" sh -lc 'command -v rman && command -v sqlplus'
+install -d -m 0750 /u02/backup/verification
 ```
 
-Run the program manually once and preserve the resulting successful log. Verify that the log contains the RMAN crosscheck, expired/missing-artifact assessment, restore validation, and final status. Also test at least one controlled failure path, then correct it; do not leave the schedule or backup catalog in a failed state.
+Your host script must:
 
-## Task 5 — Schedule and verify the program
+1. Use strict Bash error handling and propagate a nonzero status from Docker, RMAN, log checks, or setup failures.
+2. Acquire a nonblocking `flock` lock and fail if another run holds it.
+3. Dynamically discover `oracle-free` on every invocation using the required Docker filters.
+4. Count matches and fail unless exactly one intended running container exists.
+5. Create a unique UTC timestamped log under `/u02/backup/verification/` and capture standard output and standard error.
+6. Record UTC start/end times, host, discovered container ID, database, and final exit status without exposing credentials.
+7. Run RMAN inside the discovered container with `docker exec`, connecting locally with operating-system authentication.
+8. Perform real `CROSSCHECK BACKUP`, archived-log crosscheck, and a non-destructive `RESTORE DATABASE VALIDATE` or equivalent database restore validation.
+9. Detect and report unacceptable expired/missing artifacts after crosscheck.
+10. Avoid writes to live restored datafiles and never stop or remove the container.
+11. Avoid `|| true`, unconditional success text, or any wrapper that hides RMAN's exit status.
 
-Choose **systemd** or **cron**. For systemd, use these concrete unit paths:
+Ensure the literal RMAN operations are present in the executable script so validation can inspect them. Use input redirection or a quoted here-document carefully so the RMAN command text reaches RMAN inside the container rather than being interpreted by the host shell.
 
-- `/etc/systemd/system/rman-verify.service`
-- `/etc/systemd/system/rman-verify.timer`
+Run `/usr/local/sbin/rman-verify.sh` manually and retain its successful timestamped log. Test one controlled failure, such as contention on the lock, and verify a nonzero exit status. Correct the condition afterward; do not damage backup files or leave RMAN metadata in a failed state.
 
-For cron, use `/etc/cron.d/rman-verify`. In either case, run as the Oracle software owner, use absolute paths, and schedule recurring execution. Do not embed database or AWS passwords.
+Confirm the Oracle instance and container remain available:
 
-After enabling the schedule, trigger one execution and retain proof in `/opt/lab/evidence/ex3/schedule.txt`. The proof must show:
+```bash
+docker ps --filter name=oracle-free --filter status=running
+docker exec "$CONTAINER_ID" sqlplus -s / as sysdba <<'SQL'
+set heading off feedback off pages 0
+select instance_name || ':' || status from v$instance;
+exit
+SQL
+```
 
-- The schedule is installed and enabled or active as appropriate.
-- The next scheduled run is visible.
-- A manual scheduled invocation completed successfully.
-- A recent timestamped successful log exists under `/u02/backup/verification/`.
-- The program itself, not a wrapper with hard-coded output, produced that log.
+## Task 5 — Schedule and verify the host program
 
-If you selected systemd, inspect the service's exit result and timer state. If you selected cron, inspect the installed crontab entry and the resulting program log; merely showing that the cron daemon is active is insufficient.
+Choose one supported host scheduler:
+
+- **systemd:** `/etc/systemd/system/rman-verify.service` and `/etc/systemd/system/rman-verify.timer`
+- **cron:** `/etc/cron.d/rman-verify`
+
+Schedule the host program with sufficient permission to access the Docker socket and `/u02/backup`. In this lab, use root for the system service or cron entry; Oracle authentication remains local inside the container. Use absolute paths and do not embed Oracle or AWS passwords.
+
+For systemd, reload units, enable and start the timer, inspect its next run, then start the oneshot service once. Verify the service result rather than assuming that an active timer proves the command succeeded. For cron, inspect the non-comment entry and wait for or trigger an equivalent execution; merely showing that `crond` is active is insufficient.
+
+Save schedule evidence in `/opt/lab/evidence/ex3/schedule.txt`. It must show:
+
+- The installed unit or cron definition.
+- An enabled/active timer or installed recurring cron entry.
+- The next scheduled run when the scheduler exposes it.
+- A completed invocation and its exit result.
+- A recent authentic RMAN log under `/u02/backup/verification/`.
+- The dynamically discovered container remained running.
 
 ## Check your work
 
-Confirm that your evidence set is complete and readable without modifying the seeded reports:
-
 ```bash
-sudo find /opt/lab/evidence/ex3 -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
-sudo find /u02/backup/verification -maxdepth 1 -type f -printf '%TY-%Tm-%TdT%TH:%TM:%TS %f %s bytes\n' | sort | tail
+sudo chmod -R a+rX /opt/lab/evidence/ex3
+sudo find /opt/lab/evidence/ex3 -maxdepth 1 -type f \
+  -printf '%f %s bytes\n' | sort
+sudo find /u02/backup/verification -maxdepth 1 -type f \
+  -printf '%TY-%Tm-%TdT%TH:%TM:%TS %f %s bytes\n' | sort | tail
 sudo test -x /usr/local/sbin/rman-verify.sh
+sudo grep -E 'docker ps|CROSSCHECK|RESTORE.*VALIDATE|flock' \
+  /usr/local/sbin/rman-verify.sh
 ```
 
-Your final evidence must support these conclusions:
+Your evidence must support all of these conclusions:
 
-- The simulated AWR/ASH-style clues led to a diagnosis that live non-AWR observations corroborated.
-- Targeted statistics improved cardinality estimates and the access path or a stable objective metric.
-- The result checksum did not change.
-- RMAN crosscheck and restore validation execute safely, report real failures, and do not restore over live files.
-- Recurring verification is enabled and has produced a recent successful timestamped log.
+- The reports were clearly treated as simulated AWR/ASH-style clues, not Oracle-generated diagnostics.
+- Live `FREEPDB1` measurements corroborated or corrected the initial hypothesis.
+- Fresh targeted statistics improved the plan and a deterministic metric.
+- Baseline and tuned checksums are identical.
+- The host verifier dynamically discovers exactly one running container.
+- RMAN crosscheck and non-destructive restore validation run inside that container.
+- The schedule is enabled and has a recent authentic successful log.
 
-Validation 3 is backed by the exact script path `Validations/FREEPDB1 Plan and RMAN Schedule.sh`.
+Validation step 3 is backed by the exact package path `Validations/FREEPDB1 Plan and RMAN Schedule.sh`. The external validator uses AWS Systems Manager Run Command to inspect host, container, Oracle, evidence, scheduler, and log state; allow time for Systems Manager's eventual consistency.
 
 <validation step="3" />
 
 ## Exercise summary
 
-You diagnosed a reporting regression without claiming that Oracle Database Free generated AWR or ASH. You compared repeatable live measurements, corrected only the relevant optimizer statistics, and proved both performance improvement and result integrity. You also converted ad hoc RMAN checks into a scheduled verification control with overlap prevention, durable logs, and truthful failure propagation.
+You diagnosed a query regression without claiming that Oracle Database Free generated AWR or ASH. You used repeatable live measurements, corrected only the relevant optimizer statistics, and proved result integrity. You also converted ad hoc RMAN checks into a Docker-aware scheduled control with exclusive execution, durable logs, and truthful failure propagation.

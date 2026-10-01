@@ -1,187 +1,393 @@
 # Exercise 1 — Build a backup chain and perform whole-CDB SCN recovery
 
 **Estimated time:** 35 minutes  
-**Scope:** Oracle CDB level 0 and level 1 backups, archived redo, whole-CDB point-in-time recovery, `RESETLOGS`, and post-recovery protection
+**Scope:** Docker-aware Oracle CDB backup and recovery, RMAN level 0/1 backups, archived redo, SCN point-in-time recovery, `RESETLOGS`, and post-recovery protection
 
 ## Scenario
 
-A failed application release has introduced a committed bad transaction into `FREEPDB1`. Before the failure is injected, you must establish and inspect a recoverable RMAN backup chain. You will then run the supplied fault-injection script, recover the **entire CDB** to the recorded system change number (SCN), and prove that the unwanted transaction is absent while valid earlier data remains.
+A failed release introduces a committed bad transaction into `FREEPDB1`. You must first establish a usable RMAN backup chain. You will then run the supplied injection, recover the **whole CDB** to the recorded system change number (SCN), and prove that the unwanted transaction is absent while valid earlier data remains.
 
-This is a task-based assessment. The required outcomes, constraints, evidence locations, and checks are provided, but you must choose the appropriate Oracle SQL, RMAN, and Linux commands.
+Oracle Database Free runs inside the long-lived Docker container named `oracle-free`. Database shutdown, mount, restore, recovery, and open operations affect the Oracle instance **inside** that container. They must not stop or remove the container itself.
+
+This is a task-based assessment. The commands below establish the required Docker transport and safety checks; you remain responsible for interpreting Oracle state, selecting the correct recovery target, reviewing RMAN output, and proving the outcome.
 
 ## Objectives
 
 In this exercise, you will:
 
-- Verify that the CDB, `FREEPDB1`, archive logging, RMAN configuration, and `/u02/backup` are ready.
-- Create an RMAN level 0 CDB backup with archived redo and control-file/SPFILE protection.
-- Apply the supplied workload change and create a level 1 incremental backup.
-- Inspect RMAN metadata and retain evidence of the backup chain.
-- Run `/opt/lab/inject-ex1.sh` and record its recovery target SCN and bad-transaction marker.
-- Perform whole-CDB point-in-time recovery to that SCN.
-- Open the CDB with `RESETLOGS`, restore the required `FREEPDB1` open state, and verify the data outcome.
-- Record the new database incarnation and create a post-`RESETLOGS` CDB backup.
+- Verify the host mounts, Docker service, dynamically discovered `oracle-free` container, CDB/PDB state, and RMAN configuration.
+- Create a whole-CDB level 0 backup with archived redo and control-file/SPFILE protection.
+- Apply the supplied `FREEPDB1` workload change and create a level 1 backup.
+- Run `/opt/lab/inject-ex1.sh` and preserve its target SCN and marker.
+- Shut down, mount, restore, and recover the whole CDB inside the still-running container.
+- Open the CDB with `RESETLOGS`, reopen/save `FREEPDB1`, and prove the container remained running.
+- Verify the logical data outcome, record the new incarnation, and create a post-`RESETLOGS` backup.
 
-## Task 1 — Sign in and connect to the learner VM
+## Task 1 — Sign in and connect with Session Manager
 
 1. Open the AWS sign-in page: <inject key="AwsConsoleUrl"></inject>
-2. Sign in with these assigned credentials:
+2. Sign in with:
    - **User name:** <inject key="IamUserName"></inject>
    - **Password:** <inject key="IamUserPassword"></inject>
-3. Confirm that the console is showing AWS account <inject key="AwsAccountId"></inject> and Region <inject key="AwsRegion"></inject>.
-4. Open **CloudFormation** and choose **Stacks**. Find the stack associated with deployment <inject key="DeploymentID"></inject>.
-5. On the stack's **Outputs** tab, note the EC2 instance ID or SSM target output.
-6. Open **EC2** > **Instances**, select that instance, and choose **Connect**.
-7. On the **Session Manager** tab, choose **Connect**.
+3. Confirm account <inject key="AwsAccountId"></inject> and Region <inject key="AwsRegion"></inject>.
+4. Open **CloudFormation** > **Stacks**, and find the stack for deployment <inject key="DeploymentID"></inject>.
+5. On **Outputs**, note the instance ID or SSM target.
+6. Open **EC2** > **Instances**, select the lab instance, and choose **Connect**.
+7. For the connection method, choose **Session Manager**, and then choose **Connect**.
 
-> [!Note]
-> AWS documents this console path as **EC2 > Instances > select the instance > Connect > Session Manager > Connect**. Session Manager requires the node to be managed by Systems Manager and the signed-in identity to have session permissions. The lab provisions and verifies SSM Agent and attaches the required instance role during bootstrap.
+AWS documents this path as **EC2 > Instances > select instance > Connect > Session Manager > Connect**. The instance must be a Systems Manager managed node, and your identity must have permission to start the session. See [Start a session](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html).
 
-8. Confirm that bootstrap completed before changing the database:
+8. Verify bootstrap readiness and the services used by this exercise:
 
 ```bash
 sudo test -f /opt/lab/.ready && echo "Lab is ready" || echo "Bootstrap is not complete"
 sudo systemctl is-active amazon-ssm-agent
+sudo systemctl is-active docker
 ```
 
-Do not continue unless the readiness marker exists and the agent is active. Keep this Session Manager shell open throughout the exercise.
+Do not continue unless the readiness marker exists and both services are active.
 
-## Task 2 — Establish the pre-change baseline
+## Task 2 — Discover the running database container safely
 
-Create an evidence directory for this exercise if the deployment has not already created it, and review the available assets:
+Do not copy a container ID from an earlier command and assume it remains valid. Define this helper in your Session Manager shell. It filters for running containers and then requires exactly one result whose name is exactly `oracle-free`:
 
 ```bash
-sudo install -d -o oracle -g oinstall -m 0750 /opt/lab/evidence/ex1
-sudo find /opt/lab -maxdepth 2 -type f -printf '%M %u:%g %p\n' | sort
-sudo ls -ld /u02/backup /opt/lab/evidence/ex1
-lsblk -f
-findmnt /u02/backup
-df -h /u02/backup
+resolve_container() {
+  local rows
+  mapfile -t rows < <(
+    sudo docker ps \
+      --filter name=oracle-free \
+      --filter status=running \
+      --format '{{.ID}} {{.Names}}' |
+      awk '$2 == "oracle-free" {print $1}'
+  )
+
+  if (( ${#rows[@]} != 1 )); then
+    echo "Expected exactly one running container named oracle-free; found ${#rows[@]}." >&2
+    return 1
+  fi
+
+  CONTAINER_ID="${rows[0]}"
+  export CONTAINER_ID
+}
+
+resolve_container
+sudo docker inspect \
+  --format 'name={{.Name}} id={{.Id}} status={{.State.Status}} running={{.State.Running}}' \
+  "$CONTAINER_ID"
 ```
 
-Save your observations in `/opt/lab/evidence/ex1/preflight.txt`. Your evidence must show all of the following:
+Expected evidence includes `name=/oracle-free`, `status=running`, and `running=true`. Stop if discovery is ambiguous. Do not use `docker stop`, `docker restart`, `docker rm`, or `docker compose down` anywhere in this exercise.
 
-- The database role and open mode are appropriate for taking the planned backups.
-- `FREEPDB1` is open and its saved state is understood.
-- The database is in `ARCHIVELOG` mode.
-- RMAN control-file autobackup and disk-channel settings protect backup material under `/u02/backup`.
-- `/u02/backup` is a separate mounted filesystem, has sufficient free capacity, and is writable by the Oracle software owner.
-- The expected data is in `FREEPDB1`, not `CDB$ROOT`.
+> [!Note]
+> For an interactive session, the supported patterns are `sudo docker exec -it "$CONTAINER_ID" rman target /` and `sudo docker exec -it "$CONTAINER_ID" bash -lc 'sqlplus / as sysdba'`. Noninteractive examples below use `-i` so that here-documents can be captured as evidence.
 
-> [!Important]
-> Stop and investigate any failed preflight check. Do not change the database identifier, recreate the database, disable archive logging, move backup files to the root volume, or alter the protected injection scripts.
+## Task 3 — Establish and preserve the baseline
 
-## Task 3 — Create and inspect the RMAN backup chain
+1. Prepare the host evidence directory without changing the protected injection state:
 
-1. As the Oracle software owner, create a **level 0 incremental backup of the whole CDB** under `/u02/backup`.
-2. Include sufficient archived redo to make the backup recoverable. Ensure that the control file and SPFILE are protected in accordance with the configured autobackup policy.
-3. Run the supplied, exercise-tagged `FREEPDB1` workload-change asset found under `/opt/lab`. Review it before execution and confirm that it connects to `FREEPDB1` rather than `CDB$ROOT`.
-4. Force or capture the redo needed after the workload change, then create a **level 1 incremental backup** of the whole CDB.
-5. Inspect the RMAN repository and physical files. Save readable evidence to `/opt/lab/evidence/ex1/backup-chain.txt`.
+```bash
+sudo install -d -m 0770 /opt/lab/evidence/ex1
+findmnt /u02/backup
+findmnt /u01/oradata || true
+df -h /u01/oradata /u02/backup
+sudo stat -c '%u:%g %a %n' /u01/oradata /u02/backup
+sudo docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' "$CONTAINER_ID"
+```
 
-Your evidence should make it possible to identify:
+The expected design uses persistent Oracle data under `/u01/oradata` and a separate backup filesystem mounted at `/u02/backup`. Both paths use numeric owner UID/GID `54321`. The container must expose the Oracle data mount and `/u02/backup`.
 
-- Completion time and status of both backup jobs.
-- The level 0 and level 1 datafile backup sets and pieces.
-- Archived redo coverage between the backups and through the required recovery window.
-- Control-file and SPFILE protection.
-- The physical backup-piece locations on `/u02/backup`.
+2. Query the CDB through the dynamically resolved container:
 
-Do not delete archive logs merely to reduce disk use, and do not mark missing backups as available. If an RMAN command reports an error, preserve the output, determine the cause, and correct the backup operation before proceeding.
+```bash
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'sqlplus -s / as sysdba' <<'SQL' |
+  sudo tee /opt/lab/evidence/ex1/preflight-database.txt
+whenever sqlerror exit failure
+set lines 200 pages 100
+show con_name
+select name, db_unique_name, open_mode, database_role, log_mode,
+       current_scn, resetlogs_change#
+from v$database;
+select name, open_mode, restricted from v$pdbs order by con_id;
+select con_name, instance_name, status from v$instance;
+exit
+SQL
+```
+
+3. Inspect RMAN configuration from inside the same running container:
+
+```bash
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'rman target /' <<'RMAN' |
+  sudo tee /opt/lab/evidence/ex1/preflight-rman.txt
+SHOW ALL;
+LIST INCARNATION OF DATABASE;
+EXIT;
+RMAN
+```
+
+Your baseline must establish `ARCHIVELOG`, a suitable CDB/PDB open state, control-file autobackup, and disk output under `/u02/backup`. Resolve any failed preflight check before taking backups.
+
+## Task 4 — Create and inspect the backup chain
+
+1. Use RMAN **inside** the container to create a tagged level 0 whole-CDB backup, archived-redo protection, and explicit control-file/SPFILE protection. The configured disk channel determines the physical format under `/u02/backup`.
+
+```bash
+set -o pipefail
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'rman target /' <<'RMAN' 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/level0-rman.txt
+RUN {
+  SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';
+  BACKUP INCREMENTAL LEVEL 0 DATABASE TAG 'CL_EX1_L0';
+  BACKUP ARCHIVELOG ALL NOT BACKED UP 1 TIMES TAG 'CL_EX1_L0_ARC';
+  BACKUP CURRENT CONTROLFILE TAG 'CL_EX1_L0_CTL';
+  BACKUP SPFILE TAG 'CL_EX1_L0_SPFILE';
+}
+LIST BACKUP SUMMARY;
+EXIT;
+RMAN
+```
+
+Review the transcript for RMAN errors and completed pieces. Do not proceed merely because the pipeline created a text file.
+
+2. Review the supplied workload asset, confirm that it changes `FREEPDB1`, and then feed that exact host file to SQL*Plus inside the container:
+
+```bash
+sudo sed -n '1,220p' /opt/lab/workload/change.sql
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'sqlplus -s / as sysdba' \
+  < /opt/lab/workload/change.sql 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/workload-change.txt
+```
+
+3. Create the whole-CDB level 1 backup and capture redo generated through this point:
+
+```bash
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'rman target /' <<'RMAN' 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/level1-rman.txt
+RUN {
+  SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';
+  BACKUP INCREMENTAL LEVEL 1 DATABASE TAG 'CL_EX1_L1';
+  BACKUP ARCHIVELOG ALL NOT BACKED UP 1 TIMES TAG 'CL_EX1_L1_ARC';
+}
+LIST BACKUP SUMMARY;
+LIST BACKUP OF DATABASE;
+LIST BACKUP OF ARCHIVELOG ALL;
+EXIT;
+RMAN
+```
+
+4. Correlate RMAN metadata with physical files:
+
+```bash
+sudo find /u02/backup -xdev -type f -printf '%TY-%Tm-%TdT%TH:%TM:%TS %s %p\n' |
+  sort | sudo tee /opt/lab/evidence/ex1/backup-files.txt
+```
+
+Your evidence must identify completed level 0 and level 1 datafile backups, archived redo covering the recovery window, control-file/SPFILE protection, and physical pieces under `/u02/backup`.
 
 <question id="1"/>
 
-## Task 4 — Inject and verify the unwanted transaction
+## Task 5 — Inject and record the recovery boundary
 
 > [!Warning]
-> Run the injection only after you have inspected a usable level 0/level 1 chain. The script is intentionally learner-run; deployment does not run it for you. Do not edit it or invoke it more than once.
+> Run the injection exactly once, only after confirming a usable backup chain. Do not edit the script or its protected state file.
 
-1. Confirm the script is owned by root and is not world-writable:
+1. Verify and run the root-owned script:
 
 ```bash
 sudo stat -c '%A %U:%G %n' /opt/lab/inject-ex1.sh
+resolve_container
+sudo /opt/lab/inject-ex1.sh 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/injection-output.txt
 ```
 
-2. Run the supplied injection:
+2. Read the protected record, copy it to the evidence directory, and parse the two values needed for verification and recovery:
 
 ```bash
-sudo /opt/lab/inject-ex1.sh
+sudo cat /opt/lab/state/ex1.env
+sudo cp --preserve=mode,timestamps /opt/lab/state/ex1.env \
+  /opt/lab/evidence/ex1/injection-target.txt
+
+TARGET_SCN=$(sudo awk -F= '$1 == "TARGET_SCN" {print $2}' /opt/lab/state/ex1.env)
+BAD_MARKER=$(sudo awk -F= '$1 == "MARKER" {print $2}' /opt/lab/state/ex1.env)
+[[ "$TARGET_SCN" =~ ^[0-9]+$ ]] || { echo "Invalid target SCN" >&2; exit 1; }
+[[ -n "$BAD_MARKER" ]] || { echo "Missing bad marker" >&2; exit 1; }
+printf 'target_scn=%s marker=%s\n' "$TARGET_SCN" "$BAD_MARKER"
 ```
 
-3. Immediately copy the emitted **target SCN**, UTC timestamp, and unique bad-transaction marker into `/opt/lab/evidence/ex1/injection-target.txt`.
-4. Locate the protected injection record and compare it with the values you copied. Do not modify that record.
-5. Connect explicitly to `FREEPDB1` and prove that the bad-transaction marker is currently visible and committed. Also capture the provided pre-target row/checksum marker so that you can prove valid earlier data survives recovery.
+3. Connect explicitly to `FREEPDB1` and prove the marker is committed and visible. Also preserve the supplied baseline checksum or pre-target marker for later comparison. Do not delete or update the bad row.
 
-Before continuing, state the recovery boundary in your notes: the operation is **whole-CDB PITR to the recorded SCN**, not PDB-only PITR and not a targeted datafile restore.
+The required boundary is **whole-CDB PITR to `TARGET_SCN`**. PDB-only PITR, datafile-only recovery, flashback, manual row deletion, and schema recreation do not meet the objective.
 
-## Task 5 — Recover the entire CDB to the target SCN
+## Task 6 — Perform whole-CDB PITR without stopping the container
 
-Plan and carry out the recovery using RMAN and SQL*Plus. Your procedure must satisfy these constraints:
+The database instance must be shut down and mounted for whole-database restore. The Docker container must remain running throughout those Oracle state transitions.
 
-- Shut down the CDB cleanly where possible and place it in the state required for whole-database restore and recovery.
-- Use the SCN emitted by `/opt/lab/inject-ex1.sh` as the recovery boundary.
-- Restore and recover the **whole CDB**, using the level 0/level 1 chain and required archived redo.
-- Do not substitute a PDB-only recovery, table-level repair, flashback operation, manual row deletion, schema recreation, or database recreation.
-- Review RMAN's selected backup pieces and recovery messages. Resolve errors rather than bypassing them.
-- Open the recovered CDB with `RESETLOGS` only after incomplete recovery has completed successfully.
-- Open `FREEPDB1` and save its required open state after the CDB is available.
+1. Shut down only the Oracle instance:
 
-Capture the terminal transcript or equivalent RMAN and SQL evidence in `/opt/lab/evidence/ex1/pitr.txt`. The evidence must show the requested target SCN, whole-CDB scope, successful restore/recovery, and the `RESETLOGS` open.
+```bash
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'sqlplus -s / as sysdba' <<'SQL' 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/shutdown.txt
+whenever sqlerror exit failure
+shutdown immediate;
+exit
+SQL
+```
 
-> [!Tip]
-> Before issuing any destructive or state-changing command, verify your current Oracle environment, database state, container, and recovery target. A correct command issued against the wrong container or at the wrong stage does not meet the objective.
+2. **Immediately prove the container is still running**, then mount the CDB:
 
-## Task 6 — Prove the recovery outcome
+```bash
+resolve_container
+sudo docker ps --filter name=oracle-free --filter status=running \
+  --format 'id={{.ID}} name={{.Names}} status={{.Status}}' |
+  sudo tee /opt/lab/evidence/ex1/container-after-shutdown.txt
 
-After the database is open:
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'sqlplus -s / as sysdba' <<'SQL' 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/startup-mount.txt
+whenever sqlerror exit failure
+startup mount;
+select status from v$instance;
+exit
+SQL
+```
 
-1. Verify the CDB is open in the expected mode and `FREEPDB1` is open read/write.
-2. Connect explicitly to `FREEPDB1`.
-3. Prove that the unique bad-transaction marker is absent.
-4. Prove that the supplied pre-target row/checksum marker remains correct.
-5. Inspect the database incarnation history and identify the current incarnation created by `RESETLOGS`.
-6. Save these results to `/opt/lab/evidence/ex1/recovery-outcome.txt`.
+3. Resolve the container again and prove it is running in the mounted state:
 
-A successful startup alone is insufficient. The data checks must demonstrate that recovery reached the intended logical point.
+```bash
+resolve_container
+sudo docker inspect --format 'name={{.Name}} status={{.State.Status}} running={{.State.Running}}' \
+  "$CONTAINER_ID" |
+  sudo tee /opt/lab/evidence/ex1/container-at-mount.txt
+```
+
+4. Restore and recover the **whole database** to the injected SCN. Review which level 0/1 pieces and archived logs RMAN selects:
+
+```bash
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'rman target /' <<RMAN 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/pitr-rman.txt
+RUN {
+  SET UNTIL SCN ${TARGET_SCN};
+  RESTORE DATABASE;
+  RECOVER DATABASE;
+}
+EXIT;
+RMAN
+```
+
+Do not open the database if restore or recovery reports an unresolved error. Preserve the transcript and diagnose the failed piece or missing redo instead of bypassing it.
+
+5. Confirm the container still runs, and then perform the required incomplete-recovery open:
+
+```bash
+resolve_container
+sudo docker ps --filter name=oracle-free --filter status=running \
+  --format 'id={{.ID}} name={{.Names}} status={{.Status}}'
+
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'sqlplus -s / as sysdba' <<'SQL' 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/open-resetlogs.txt
+whenever sqlerror exit failure
+alter database open resetlogs;
+alter pluggable database FREEPDB1 open;
+alter pluggable database FREEPDB1 save state;
+select name, open_mode from v$database;
+select name, open_mode from v$pdbs order by con_id;
+exit
+SQL
+```
+
+6. Resolve and inspect the container once more. This is required evidence, not an optional health check:
+
+```bash
+resolve_container
+sudo docker inspect --format 'name={{.Name}} id={{.Id}} status={{.State.Status}} running={{.State.Running}}' \
+  "$CONTAINER_ID" |
+  sudo tee /opt/lab/evidence/ex1/container-after-resetlogs.txt
+```
+
+The result must still show the original named container running. A recovery performed by stopping, replacing, or recreating `oracle-free` is not accepted.
+
+## Task 7 — Prove the recovery outcome
+
+Using SQL*Plus inside the dynamically resolved container, save evidence that:
+
+- The CDB is open and `FREEPDB1` is `READ WRITE`.
+- The unique value in `BAD_MARKER` is absent from the expected `LABAPP` table.
+- The supplied pre-target row/checksum remains correct.
+- `V$DATABASE_INCARNATION` identifies one current incarnation created by the `RESETLOGS` operation.
+- The current resetlogs SCN is later than the baseline recorded by the injection.
+
+Pass the marker as a SQL*Plus variable rather than manually retyping it:
+
+```bash
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc \
+  "sqlplus -s / as sysdba @/dev/stdin '$BAD_MARKER'" <<'SQL' 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/recovery-outcome.txt
+whenever sqlerror exit failure
+set lines 220 pages 100 verify off
+alter session set container=FREEPDB1;
+select count(*) as bad_marker_count
+from LABAPP.ORDERS
+where marker = '&1';
+alter session set container=CDB$ROOT;
+select name, open_mode, current_scn, resetlogs_change#, resetlogs_time from v$database;
+select name, open_mode from v$pdbs order by con_id;
+select incarnation#, resetlogs_change#, resetlogs_time, status
+from v$database_incarnation
+order by incarnation#;
+exit
+SQL
+```
+
+Add the seeded pre-target checksum query required by the protected exercise evidence. A zero bad-marker count alone is insufficient; you must also prove earlier valid data survived.
 
 <question id="2"/>
 
-## Task 7 — Protect the new incarnation
+## Task 8 — Protect the new incarnation
 
-Create a new, usable CDB backup after `RESETLOGS`, including the archived redo and control-file/SPFILE protection required by the lab's RMAN policy. Do not assume that the pre-resetlogs chain is an adequate operational baseline for all future restore work.
+Create a new whole-CDB level 0 backup in the current post-`RESETLOGS` incarnation, with archived redo and control-file/SPFILE protection:
 
-Save repository and physical-file evidence to `/opt/lab/evidence/ex1/post-resetlogs-backup.txt`. Your evidence must correlate the backup with the current incarnation and show that its pieces exist under `/u02/backup`.
+```bash
+resolve_container
+sudo docker exec -i "$CONTAINER_ID" bash -lc 'rman target /' <<'RMAN' 2>&1 |
+  sudo tee /opt/lab/evidence/ex1/post-resetlogs-backup.txt
+RUN {
+  SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';
+  BACKUP INCREMENTAL LEVEL 0 DATABASE TAG 'CL_EX1_POST_RESETLOGS_L0';
+  BACKUP ARCHIVELOG ALL NOT BACKED UP 1 TIMES TAG 'CL_EX1_POST_RESETLOGS_ARC';
+  BACKUP CURRENT CONTROLFILE TAG 'CL_EX1_POST_RESETLOGS_CTL';
+  BACKUP SPFILE TAG 'CL_EX1_POST_RESETLOGS_SPFILE';
+}
+LIST INCARNATION OF DATABASE;
+LIST BACKUP SUMMARY;
+EXIT;
+RMAN
+```
 
-In two or three sentences in the same file, explain:
-
-- How `OPEN RESETLOGS` changes the database incarnation and redo stream.
-- Why taking a prompt backup of the new incarnation reduces recovery risk and simplifies subsequent work, including Exercise 2.
+Correlate the current incarnation, completion time, and handles with files under `/u02/backup`. In your evidence, briefly explain why `OPEN RESETLOGS` creates a new incarnation/redo stream and why a prompt backup provides the baseline needed by Exercise 2.
 
 ## Review and validation
 
-Before running validation, confirm that your evidence directory contains at least:
+Confirm that `/opt/lab/evidence/ex1` contains your preflight, level 0/1, injection, state-transition, PITR, container-running, logical-outcome, incarnation, and post-`RESETLOGS` evidence.
 
-```text
-/opt/lab/evidence/ex1/preflight.txt
-/opt/lab/evidence/ex1/backup-chain.txt
-/opt/lab/evidence/ex1/injection-target.txt
-/opt/lab/evidence/ex1/pitr.txt
-/opt/lab/evidence/ex1/recovery-outcome.txt
-/opt/lab/evidence/ex1/post-resetlogs-backup.txt
-```
+Your completed environment must satisfy all of these checks:
 
-Your completed environment should satisfy these outcome checks:
-
-- A valid level 0 and level 1 whole-CDB backup chain exists, with archived redo and control-file/SPFILE protection.
-- The protected injection record exists and has not been modified.
-- Whole-CDB PITR used the injected target SCN.
-- The CDB was opened with `RESETLOGS`, and the new incarnation is recorded.
+- Exactly one intended container named `oracle-free` is running.
+- A usable whole-CDB level 0/1 chain, archived redo, control-file/SPFILE protection, and physical pieces exist under `/u02/backup`.
+- Whole-CDB PITR used the protected injected target SCN.
+- Oracle shutdown, mount, restore, recovery, and `RESETLOGS` occurred inside the running container.
+- `docker ps`/`docker inspect` evidence proves the container remained running across database state transitions.
 - `FREEPDB1` is open, the bad transaction is absent, and pre-target data remains correct.
-- A usable CDB backup exists in the current post-`RESETLOGS` incarnation.
-- Backup pieces remain on the separate `/u02/backup` filesystem.
+- The new incarnation is current and has a usable post-`RESETLOGS` backup.
 
 <validation step="1"/>
 
 ## Completion
 
-You have established an RMAN incremental backup chain, recovered the complete container database to a known SCN, verified the `FREEPDB1` business outcome, and protected the new incarnation. Leave the CDB and `FREEPDB1` open and healthy for Exercise 2.
+You have established an RMAN incremental chain, recovered the entire CDB to the known SCN without stopping or replacing its Docker container, verified the `FREEPDB1` business outcome, and protected the new incarnation. Leave `oracle-free`, the CDB, and `FREEPDB1` running and healthy for Exercise 2.
