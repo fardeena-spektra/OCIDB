@@ -26,11 +26,11 @@
     },
     {
       "ParameterKey": "InstanceType",
-      "ParameterValue": "t3.large"
+      "ParameterValue": "t3.medium"
     },
     {
       "ParameterKey": "BootstrapScriptUrl",
-      "ParameterValue": "https://raw.githubusercontent.com/fardeena-spektra/OCIDB/refs/heads/main/Userdata/userdata.sh"
+      "ParameterValue": "https://raw.githubusercontent.com/fardeena-spektra/OCIDB/refs/heads/main/DeploymentPackage/Scripts/userdata.sh"
     }
   ]
 }
