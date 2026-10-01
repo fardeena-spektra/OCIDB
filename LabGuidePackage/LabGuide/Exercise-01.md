@@ -386,7 +386,7 @@ Your completed environment must satisfy all of these checks:
 - `FREEPDB1` is open, the bad transaction is absent, and pre-target data remains correct.
 - The new incarnation is current and has a usable post-`RESETLOGS` backup.
 
-<validation step="1"/>
+<validation step="79c523ae-e3db-4292-9079-2e33fb7cc8c5"/>
 
 ## Completion
 
